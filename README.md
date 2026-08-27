@@ -4,9 +4,9 @@
 A minimal manager for AI coding-agent CLIs, in a single zsh script.
 
 ```
-● claude     2.1.247    native   ~/.local/bin/claude → ~/.local/share/claude/versions/2.1.247
-● codex      0.150.1    npm      ~/.local/.../bin/codex → .../@openai/codex/bin/codex.js
-● amp        0.0.17...  native   ~/.local/bin/amp → ~/.amp/bin/amp
+● claude     2.1.247    native   ~/.local/share/claude/versions/2.1.247
+● codex      0.150.1    npm      ~/.local/.../node_modules/@openai/codex/bin/codex.js
+● amp        0.0.17...  native   ~/.amp/bin/amp
 ○ opencode   —          curl -fsSL https://opencode.ai/install | bash
 ```
 

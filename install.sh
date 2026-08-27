@@ -9,9 +9,9 @@ RAW_URL="https://raw.githubusercontent.com/mrzzmrzz/agents-cli/main/agents"
 mkdir -p "$BIN_DIR"
 curl -fsSL "$RAW_URL" -o "$BIN_DIR/agents"
 chmod +x "$BIN_DIR/agents"
-echo "✓ agents 已安装到 $BIN_DIR/agents"
+echo "✓ agents installed to $BIN_DIR/agents"
 
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
-  *) echo "⚠ $BIN_DIR 不在 PATH 里, 请加到 shell 配置: export PATH=\"$BIN_DIR:\$PATH\"" ;;
+  *) echo "⚠ $BIN_DIR is not in PATH, add to your shell config: export PATH=\"$BIN_DIR:\$PATH\"" ;;
 esac

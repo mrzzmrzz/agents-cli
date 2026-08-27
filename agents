@@ -4,8 +4,8 @@
 set -uo pipefail
 
 # ── registry ──────────────────────────────────────────────────────────
-# 每个 agent 一行元数据: via^install^update^uninstall
-# 新增 agent 只需在 KNOWN 和 meta() 里各加一行
+# One line of metadata per agent: via^install^update^uninstall
+# To add an agent, add one line to KNOWN and one to meta()
 KNOWN=(claude codex amp pi opencode)
 
 meta() {
@@ -22,9 +22,9 @@ meta() {
 # ── ui ────────────────────────────────────────────────────────────────
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
   BOLD=$'\e[1m' DIM=$'\e[2m' RST=$'\e[0m'
-  GRN=$'\e[32m' YLW=$'\e[33m' RED=$'\e[31m' CYN=$'\e[36m'
+  GRN=$'\e[32m' RED=$'\e[31m' CYN=$'\e[36m'
 else
-  BOLD='' DIM='' RST='' GRN='' YLW='' RED='' CYN=''
+  BOLD='' DIM='' RST='' GRN='' RED='' CYN=''
 fi
 OK="${GRN}●${RST}" NOPE="${DIM}○${RST}" ARROW="${CYN}▸${RST}"
 
@@ -32,19 +32,19 @@ tilde() { print -r -- "${1/#$HOME/~}"; }
 die()   { print -u2 "${RED}✗${RST} $*"; exit 1; }
 note()  { print -r -- "$ARROW $*"; }
 
-# 执行命令, 静默成功; 失败时回放输出
+# Run a command quietly; replay its output only on failure
 run() {
   local out; out=$(mktemp)
   if eval "$1" >"$out" 2>&1; then rm -f "$out"; return 0; fi
-  print -u2 "${RED}── 输出 ──${RST}"; tail -20 "$out" >&2; rm -f "$out"; return 1
+  print -u2 "${RED}── output ──${RST}"; tail -20 "$out" >&2; rm -f "$out"; return 1
 }
 
 field() { meta "$1" | cut -d'^' -f"$2"; }
 installed() { command -v "$1" >/dev/null 2>&1; }
 version_of() { "$1" --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+[0-9a-z.-]*' | head -1; }
-known_or_die() { meta "$1" >/dev/null 2>&1 || die "未知 agent: ${BOLD}$1${RST} ${DIM}(agents list)${RST}"; }
+known_or_die() { meta "$1" >/dev/null 2>&1 || die "unknown agent: ${BOLD}$1${RST} ${DIM}(agents list)${RST}"; }
 
-# 版本列宽: 取已安装 agent 版本号的最大长度
+# Version column width: longest installed version string
 ver_width() {
   local w=7 v
   for a in $KNOWN; do
@@ -60,13 +60,12 @@ cmd_show() {
   for a in $KNOWN; do
     installed "$a" || continue
     found=1
-    local p=$(command -v "$a") real=""
-    [[ -L "$p" ]] && real="${DIM} → $(tilde "$(readlink -f "$p")")${RST}"
-    printf "%s %s%-10s%s %s%-${vw}s%s %s%-8s%s %s%s\n" \
+    local p=$(readlink -f "$(command -v "$a")")
+    printf "%s %s%-10s%s %s%-${vw}s%s %s%-8s%s %s\n" \
       "$OK" "$BOLD" "$a" "$RST" "$GRN" "$(version_of "$a")" "$RST" \
-      "$DIM" "$(field "$a" 1)" "$RST" "$(tilde "$p")" "$real"
+      "$DIM" "$(field "$a" 1)" "$RST" "$(tilde "$p")"
   done
-  (( found )) || echo "没有已安装的 agent ${DIM}(agents list 查看可安装的)${RST}"
+  (( found )) || echo "no agents installed ${DIM}(try: agents list)${RST}"
 }
 
 cmd_list() {
@@ -83,20 +82,20 @@ cmd_list() {
 
 cmd_install() {
   local target="${1:-}"
-  [[ -z "$target" ]] && die "用法: agents install <name|all>"
+  [[ -z "$target" ]] && die "usage: agents install <name|all>"
   local list=()
   if [[ "$target" == all ]]; then
     for a in $KNOWN; do installed "$a" || list+=("$a"); done
-    (( $#list )) || { note "全部已安装"; return; }
+    (( $#list )) || { note "everything already installed"; return; }
   else
     known_or_die "$target"
-    installed "$target" && { note "${BOLD}$target${RST} 已安装 ${GRN}$(version_of "$target")${RST}"; return; }
+    installed "$target" && { note "${BOLD}$target${RST} already installed ${GRN}$(version_of "$target")${RST}"; return; }
     list=("$target")
   fi
   for a in $list; do
-    note "安装 ${BOLD}$a${RST} ${DIM}$(field "$a" 2)${RST}"
-    run "$(field "$a" 2)" || die "$a 安装失败"
-    print -r -- "$OK ${BOLD}$a${RST} ${GRN}$(version_of "$a")${RST} 已安装"
+    note "installing ${BOLD}$a${RST} ${DIM}$(field "$a" 2)${RST}"
+    run "$(field "$a" 2)" || die "$a install failed"
+    print -r -- "$OK ${BOLD}$a${RST} ${GRN}$(version_of "$a")${RST} installed"
   done
 }
 
@@ -105,18 +104,18 @@ cmd_update() {
   local list=()
   if [[ -n "$target" ]]; then
     known_or_die "$target"
-    installed "$target" || die "$target 未安装"
+    installed "$target" || die "$target is not installed"
     list=("$target")
   else
     for a in $KNOWN; do installed "$a" && list+=("$a"); done
   fi
   for a in $list; do
     local old=$(version_of "$a")
-    printf "%s 更新 %s%-10s%s " "$ARROW" "$BOLD" "$a" "$RST"
-    if ! run "$(field "$a" 3)"; then print -r -- "${RED}失败${RST}"; continue; fi
+    printf "%s updating %s%-10s%s " "$ARROW" "$BOLD" "$a" "$RST"
+    if ! run "$(field "$a" 3)"; then print -r -- "${RED}failed${RST}"; continue; fi
     local new=$(version_of "$a")
     if [[ "$old" == "$new" ]]; then
-      print -r -- "${DIM}$new (已是最新)${RST}"
+      print -r -- "${DIM}$new (up to date)${RST}"
     else
       print -r -- "$old ${GRN}→ $new${RST}"
     fi
@@ -125,27 +124,27 @@ cmd_update() {
 
 cmd_uninstall() {
   local target="${1:-}"
-  [[ -z "$target" ]] && die "用法: agents uninstall <name>"
+  [[ -z "$target" ]] && die "usage: agents uninstall <name>"
   known_or_die "$target"
-  installed "$target" || die "$target 未安装"
+  installed "$target" || die "$target is not installed"
   local cmd=$(field "$target" 4)
-  note "卸载 ${BOLD}$target${RST} ${DIM}$cmd${RST}"
-  printf "确认? [y/N] "; read -r ans
-  [[ "$ans" == [yY] ]] || { echo "取消"; return; }
-  eval "$cmd" && print -r -- "$OK ${BOLD}$target${RST} 已卸载"
+  note "uninstalling ${BOLD}$target${RST} ${DIM}$cmd${RST}"
+  printf "confirm? [y/N] "; read -r ans
+  [[ "$ans" == [yY] ]] || { echo "cancelled"; return; }
+  eval "$cmd" && print -r -- "$OK ${BOLD}$target${RST} uninstalled"
 }
 
 cmd_help() {
   cat <<EOF
-${BOLD}agents${RST} — AI coding-agent 管理入口
+${BOLD}agents${RST} — minimal AI coding-agent manager
 
-  ${CYN}agents${RST} ${DIM}[show]${RST}           已安装的 agent (版本 / 渠道 / 路径)
-  ${CYN}agents list${RST}             全部支持的 agent 及安装状态
-  ${CYN}agents install${RST} <x|all>  安装
-  ${CYN}agents update${RST} ${DIM}[x]${RST}       更新全部, 或只更新 x
-  ${CYN}agents uninstall${RST} <x>    卸载 (需确认)
+  ${CYN}agents${RST} ${DIM}[show]${RST}           installed agents (version / channel / path)
+  ${CYN}agents list${RST}             all supported agents and their status
+  ${CYN}agents install${RST} <x|all>  install
+  ${CYN}agents update${RST} ${DIM}[x]${RST}       update everything, or just x
+  ${CYN}agents uninstall${RST} <x>    uninstall (asks for confirmation)
 
-  ${DIM}别名: ls=list  up=update  rm=uninstall${RST}
+  ${DIM}aliases: ls=list  up=update  rm=uninstall${RST}
 EOF
 }
 
@@ -157,5 +156,5 @@ case "${1:-show}" in
   update|up)     cmd_update "${2:-}" ;;
   uninstall|rm)  cmd_uninstall "${2:-}" ;;
   -h|--help|help) cmd_help ;;
-  *) die "未知命令: $1 ${DIM}(agents help)${RST}" ;;
+  *) die "unknown command: $1 ${DIM}(agents help)${RST}" ;;
 esac
