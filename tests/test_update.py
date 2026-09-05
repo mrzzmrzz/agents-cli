@@ -25,9 +25,31 @@ def finish(code=0, text=""):
     sys.exit(code)
 def restart():
     if s.get("restart_fail"): finish(1, "restart refused")
-    if not s.get("stale_after_restart"): s["server"] = s["codex"]
+    if not s.get("stale_after_restart"):
+        s["server"] = s["standalone"] if name == "codex" else s["codex"]
     finish()
 if name == "sleep": finish()
+if name == "curl":
+    if s.get("download_fail"): finish(22, "download failed")
+    if "https://chatgpt.com/codex/install.sh" in args:
+        finish(text="exec " + sys.executable + " " + str(pathlib.Path(sys.argv[0]).with_name("install-standalone")))
+    if "install_claude" in s:
+        binary = pathlib.Path(os.environ["HOME"]) / ".local/bin/claude"
+        binary.parent.mkdir(parents=True, exist_ok=True)
+        binary.write_text("#!/bin/sh\necho '" + s["install_claude"] + "'\n")
+        binary.chmod(0o755)
+    finish()
+if name == "install-standalone":
+    assert os.environ["CODEX_NON_INTERACTIVE"] == "1"
+    assert os.environ["CODEX_INSTALL_DIR"] in os.environ["PATH"].split(":")
+    if s.get("standalone_fail"): finish(1, "standalone install failed")
+    s["standalone"] = s.get("standalone_version", os.environ["CODEX_RELEASE"])
+    home = pathlib.Path(os.environ.get("CODEX_HOME", os.environ["HOME"] + "/.codex"))
+    binary = home / "packages/standalone/current/bin/codex"
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    binary.write_text(pathlib.Path(sys.argv[0]).read_text())
+    binary.chmod(0o755)
+    finish()
 if name == "restart-codex": restart()
 if name == "systemctl":
     if "is-active" in args:
@@ -36,14 +58,18 @@ if name == "systemctl":
     if "restart" in args: restart()
     finish(1)
 if name == "npm":
+    if args == ["root", "-g"]:
+        finish(text=s.get("npm_root", str(pathlib.Path(sys.argv[0]).parent.parent / "node_modules")))
     agent = "codex" if "@openai/codex@latest" in args else "pi"
     if s.get("update_fail") == agent: finish(1, "install failed")
     s[agent] = s.get("new_" + agent, s.get(agent, "1.0.0"))
     finish()
-if args == ["--version"]: finish(text=name + " " + s[name])
+managed = "standalone/current" in sys.argv[0]
+if args == ["--version"]:
+    finish(text=name + " " + s["standalone" if managed else name])
 if name == "codex":
     if args == ["features", "list"]:
-        finish(1 if s.get("config_fail") else 0, "config check")
+        finish(1 if s.get("managed_config_fail" if managed else "config_fail") else 0, "config check")
     if args == ["app-server", "daemon", "restart"]: restart()
     if args == ["app-server", "daemon", "version"]:
         if s.get("status_fail"): finish(1, "status unavailable")
@@ -67,8 +93,8 @@ class UpdateTests(unittest.TestCase):
         self.home.mkdir()
         self.state_path = self.root / "state.json"
         self.state = {"codex": "1.0.0", "new_codex": "1.1.0",
-                      "server": "1.0.0", "calls": []}
-        for name in ("codex", "npm", "systemctl", "sleep", "restart-codex"):
+                      "server": "1.0.0", "standalone": "1.0.0", "calls": []}
+        for name in ("codex", "npm", "systemctl", "sleep", "restart-codex", "curl", "install-standalone"):
             self.install_mock(name)
         self.env = {"PATH": str(self.bin) + ":/usr/bin:/bin",
                     "HOME": str(self.home), "NO_COLOR": "1",
@@ -81,15 +107,24 @@ class UpdateTests(unittest.TestCase):
 
     def install_mock(self, name):
         p = self.bin / name
+        if name in ("codex", "pi"):
+            package = "@openai/codex" if name == "codex" else "@earendil-works/pi-coding-agent"
+            target = self.root / "node_modules" / package / "bin" / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            p.symlink_to(target)
+            p = target
         p.write_text("#!" + sys.executable + "\n" + MOCK)
         p.chmod(0o755)
 
-    def run_update(self, *args):
+    def run_agents(self, *args, input=None):
         self.state_path.write_text(json.dumps(self.state))
-        result = subprocess.run([ZSH, str(AGENTS), "update", *args],
+        result = subprocess.run([ZSH, str(AGENTS), *args], input=input,
                                 env=self.env, capture_output=True, text=True, timeout=30)
         self.state = json.loads(self.state_path.read_text())
         return result
+
+    def run_update(self, *args):
+        return self.run_agents("update", *args)
 
     def restarts(self):
         return [c for c in self.state["calls"]
@@ -98,6 +133,7 @@ class UpdateTests(unittest.TestCase):
     def test_update_restarts_and_verifies_native_daemon(self):
         r = self.run_update("codex")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.state["standalone"], "1.1.0")
         self.assertEqual(self.restarts(), [["codex", "app-server", "daemon", "restart"]])
         self.assertIn("1.1.0 verified", r.stdout)
 
@@ -205,6 +241,70 @@ class UpdateTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertFalse(self.restarts())
         self.assertFalse(any(c[0] == "codex" for c in self.state["calls"]))
+
+    def test_standalone_failures_preserve_server(self):
+        for failure in ("download_fail", "standalone_fail", "managed_config_fail"):
+            with self.subTest(failure=failure):
+                self.state[failure] = True
+                r = self.run_update("codex")
+                self.assertNotEqual(r.returncode, 0)
+                self.assertFalse(self.restarts())
+                self.assertEqual(self.state["server"], "1.0.0")
+                del self.state[failure]
+
+    def test_standalone_version_mismatch_preserves_server(self):
+        self.state["standalone_version"] = "1.0.0"
+        r = self.run_update("codex")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("leaving server untouched", r.stderr)
+        self.assertFalse(self.restarts())
+
+    def test_wrong_npm_prefix_blocks_update_and_uninstall(self):
+        self.state["npm_root"] = str(self.root / "other-prefix/node_modules")
+        for command in ("update", "uninstall"):
+            with self.subTest(command=command):
+                r = self.run_agents(command, "codex", input="y\n")
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn("unsupported installation", r.stderr)
+                self.assertTrue(all(c == ["npm", "root", "-g"] for c in self.state["calls"]))
+
+    def test_unsupported_native_install_is_not_modified(self):
+        self.install_mock("amp")
+        for command in ("update", "uninstall"):
+            r = self.run_agents(command, "amp", input="y\n")
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("unsupported installation", r.stderr)
+            self.assertFalse(self.state["calls"])
+
+    def test_install_without_visible_command_fails(self):
+        r = self.run_agents("install", "claude")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("not on PATH", r.stderr)
+
+    def test_install_verifies_visible_version(self):
+        self.env["PATH"] = str(self.home / ".local/bin") + ":" + self.env["PATH"]
+        for version in ("unreadable", "1.2.3"):
+            with self.subTest(version=version):
+                self.state["install_claude"] = version
+                r = self.run_agents("install", "claude")
+                if version == "unreadable":
+                    self.assertNotEqual(r.returncode, 0)
+                    self.assertIn("version is unreadable", r.stderr)
+                else:
+                    self.assertEqual(r.returncode, 0, r.stderr)
+                    self.assertIn("1.2.3 installed", r.stdout)
+                (self.home / ".local/bin/claude").unlink()
+
+    def test_non_npm_binary_in_same_bin_directory_is_rejected(self):
+        binary = self.bin / "codex"
+        content = binary.read_text()
+        binary.unlink()
+        binary.write_text(content)
+        binary.chmod(0o755)
+        r = self.run_update("codex")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("unsupported installation", r.stderr)
+        self.assertEqual(self.state["calls"], [["npm", "root", "-g"]])
 
 
 if __name__ == "__main__":

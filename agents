@@ -44,6 +44,24 @@ installed() { command -v "$1" >/dev/null 2>&1; }
 version_of() { "$1" --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+[0-9a-z.-]*' | head -1; }
 known_or_die() { meta "$1" >/dev/null 2>&1 || die "unknown agent: ${BOLD}$1${RST} ${DIM}(agents list)${RST}"; }
 
+# Only mutate installations owned by the configured channel.
+check_installation() {
+  local actual=$(command -v "$1") expected root
+  actual=${actual:A}
+  case "$1" in
+    codex|pi)
+      root=$(npm root -g) || return 1
+      if [[ "$1" == codex ]]; then expected="$root/@openai/codex"
+      else expected="$root/@earendil-works/pi-coding-agent"; fi
+      [[ "$actual" == "${expected:A}/"* ]] && return 0 ;;
+    claude) [[ "$actual" == "$HOME/.local/share/claude/versions/"* || "$actual" == "$HOME/.local/bin/claude" ]] && return 0 ;;
+    amp) [[ "$actual" == "$HOME/.amp/bin/amp" || "$actual" == "$HOME/.local/bin/amp" ]] && return 0 ;;
+    opencode) [[ "$actual" == "$HOME/.opencode/bin/opencode" || "$actual" == "$HOME/.local/bin/opencode" ]] && return 0 ;;
+  esac
+  print -u2 -- "$1: unsupported installation at $actual; use its own installer or fix PATH"
+  return 1
+}
+
 # Read the daemon's flat string fields (status/version, never arbitrary JSON).
 daemon_field() {
   print -r -- "$1" | sed -nE 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*"([^"\\]*)".*/\1/p'
@@ -59,6 +77,18 @@ restart_codex_server() {
        systemctl is-active --quiet codex-app-server.service 2>/dev/null; then
     run 'systemctl restart codex-app-server.service'
   else
+    # Native daemon restart uses the standalone install, not the npm CLI.
+    # Keep its launcher off the user's PATH and suppress installer prompts.
+    local -x CODEX_NON_INTERACTIVE=1 CODEX_RELEASE="$1"
+    local -x CODEX_INSTALL_DIR="${CODEX_HOME:-$HOME/.codex}/packages/standalone/bin"
+    run 'curl -fsSL https://chatgpt.com/codex/install.sh | PATH="$CODEX_INSTALL_DIR:$PATH" bash' || return 1
+    local managed="${CODEX_HOME:-$HOME/.codex}/packages/standalone/current/bin/codex"
+    [[ -x "$managed" ]] || managed="${CODEX_HOME:-$HOME/.codex}/packages/standalone/current/codex"
+    if [[ "$(version_of "$managed")" != "$1" ]]; then
+      print -u2 -- 'standalone Codex does not match the updated CLI; leaving server untouched'
+      return 1
+    fi
+    run "${(q)managed} features list" || return 1
     run 'codex app-server daemon restart'
   fi
 }
@@ -87,7 +117,7 @@ post_update_codex() {
   # Validate config with the new CLI before interrupting the existing server.
   run 'codex features list' || return 1
   note "restarting codex app-server ${running:-unknown} → $expected (active tasks may be interrupted)"
-  if ! restart_codex_server; then
+  if ! restart_codex_server "$expected"; then
     print -u2 -- 'codex updated, but app-server restart failed; check its service manager or set AGENTS_CODEX_RESTART_CMD'
     return 1
   fi
@@ -155,7 +185,12 @@ cmd_install() {
   for a in $list; do
     note "installing ${BOLD}$a${RST} ${DIM}$(field "$a" 2)${RST}"
     run "$(field "$a" 2)" || die "$a install failed"
-    print -r -- "$OK ${BOLD}$a${RST} ${GRN}$(version_of "$a")${RST} installed"
+    rehash
+    installed "$a" || die "$a installer finished, but command is not on PATH; check the install directory"
+    local version=$(version_of "$a")
+    [[ -n "$version" ]] || die "$a installer finished, but installed version is unreadable"
+    check_installation "$a" || return 1
+    print -r -- "$OK ${BOLD}$a${RST} ${GRN}$version${RST} installed"
   done
 }
 
@@ -170,6 +205,7 @@ cmd_update() {
     for a in $KNOWN; do installed "$a" && list+=("$a"); done
   fi
   for a in $list; do
+    check_installation "$a" || { failed=1; continue; }
     local old=$(version_of "$a")
     printf "%s updating %s%-10s%s " "$ARROW" "$BOLD" "$a" "$RST"
     if ! run "$(field "$a" 3)"; then print -r -- "${RED}failed${RST}"; failed=1; continue; fi
@@ -198,6 +234,7 @@ cmd_uninstall() {
   [[ -z "$target" ]] && die "usage: agents uninstall <name>"
   known_or_die "$target"
   installed "$target" || die "$target is not installed"
+  check_installation "$target" || return 1
   local cmd=$(field "$target" 4)
   note "uninstalling ${BOLD}$target${RST} ${DIM}$cmd${RST}"
   printf "confirm? [y/N] "; read -r ans

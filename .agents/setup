@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+sudo_cmd=()
+if (( EUID != 0 )); then
+  sudo_cmd=(sudo)
+fi
+
+echo 'Checking runtime dependencies...'
+SECONDS=0
+packages=()
+for tool in zsh curl node npm; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    case "$tool" in
+      node) packages+=(nodejs) ;;
+      *) packages+=("$tool") ;;
+    esac
+  fi
+done
+if (( ${#packages[@]} )); then
+  "${sudo_cmd[@]}" apt-get update
+  "${sudo_cmd[@]}" env DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}"
+fi
+echo "Runtime dependencies ready (${SECONDS}s)."
+
+echo 'Linking agents to the working tree...'
+SECONDS=0
+bin_dir="$HOME/.local/bin"
+mkdir -p "$bin_dir"
+if [[ -e "$bin_dir/agents" || -L "$bin_dir/agents" ]]; then
+  if [[ "$(readlink -f "$bin_dir/agents")" != "$repo_root/agents" ]]; then
+    echo "Refusing to replace existing $bin_dir/agents" >&2
+    exit 1
+  fi
+else
+  ln -s "$repo_root/agents" "$bin_dir/agents"
+fi
+
+if ! /bin/bash -lc 'command -v agents >/dev/null 2>&1'; then
+  profile_line='export PATH="$HOME/.local/bin:$PATH"'
+  if ! grep -Fqx "$profile_line" "$HOME/.bash_profile" 2>/dev/null; then
+    printf '\n%s\n' "$profile_line" >> "$HOME/.bash_profile"
+  fi
+fi
+echo "Command environment ready (${SECONDS}s)."
+
+echo 'Checking shell syntax...'
+SECONDS=0
+zsh -n "$repo_root/agents"
+sh -n "$repo_root/install.sh"
+echo "Shell syntax checks passed (${SECONDS}s)."
+echo 'agents-cli environment ready.'
