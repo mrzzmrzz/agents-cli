@@ -44,6 +44,66 @@ installed() { command -v "$1" >/dev/null 2>&1; }
 version_of() { "$1" --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+[0-9a-z.-]*' | head -1; }
 known_or_die() { meta "$1" >/dev/null 2>&1 || die "unknown agent: ${BOLD}$1${RST} ${DIM}(agents list)${RST}"; }
 
+# Read the daemon's flat string fields (status/version, never arbitrary JSON).
+daemon_field() {
+  print -r -- "$1" | sed -nE 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*"([^"\\]*)".*/\1/p'
+}
+
+restart_codex_server() {
+  if [[ -n "${AGENTS_CODEX_RESTART_CMD:-}" ]]; then
+    run "$AGENTS_CODEX_RESTART_CMD"
+  elif [[ "${CODEX_HOME:-$HOME/.codex}" == "$HOME/.codex" ]] && installed systemctl &&
+       systemctl --user is-active --quiet codex-app-server.service 2>/dev/null; then
+    run 'systemctl --user restart codex-app-server.service'
+  elif [[ "${CODEX_HOME:-$HOME/.codex}" == "$HOME/.codex" && $EUID == 0 ]] && installed systemctl &&
+       systemctl is-active --quiet codex-app-server.service 2>/dev/null; then
+    run 'systemctl restart codex-app-server.service'
+  else
+    run 'codex app-server daemon restart'
+  fi
+}
+
+post_update_codex() {
+  local expected="$1" info daemon_state running attempt
+  if [[ ! -S "${CODEX_HOME:-$HOME/.codex}/app-server-control/app-server-control.sock" ]]; then
+    note 'codex app-server is not running locally; leaving it stopped'
+    return 0
+  fi
+  if ! info=$(codex app-server daemon version); then
+    print -u2 -- 'codex updated, but app-server status could not be checked'
+    return 1
+  fi
+  daemon_state=$(daemon_field "$info" status)
+  running=$(daemon_field "$info" appServerVersion)
+  case "$daemon_state" in
+    stopped) note 'codex app-server is stopped; leaving it stopped'; return 0 ;;
+    running) ;;
+    *) print -u2 -- "cannot reconcile codex app-server: status ${daemon_state:-unknown}"; return 1 ;;
+  esac
+  if [[ "$running" == "$expected" ]]; then
+    note "codex app-server $running (up to date)"
+    return 0
+  fi
+  # Validate config with the new CLI before interrupting the existing server.
+  run 'codex features list' || return 1
+  note "restarting codex app-server ${running:-unknown} → $expected (active tasks may be interrupted)"
+  if ! restart_codex_server; then
+    print -u2 -- 'codex updated, but app-server restart failed; check its service manager or set AGENTS_CODEX_RESTART_CMD'
+    return 1
+  fi
+  for attempt in {1..15}; do
+    if info=$(codex app-server daemon version 2>/dev/null) &&
+       [[ "$(daemon_field "$info" status)" == running &&
+          "$(daemon_field "$info" appServerVersion)" == "$expected" ]]; then
+      print -r -- "$OK codex app-server $expected verified"
+      return 0
+    fi
+    sleep 1
+  done
+  print -u2 -- "codex updated, but app-server did not report version $expected; check its executable path"
+  return 1
+}
+
 # Version column width: longest installed version string
 ver_width() {
   local w=7 v
@@ -101,7 +161,7 @@ cmd_install() {
 
 cmd_update() {
   local target="${1:-}"
-  local list=()
+  local list=() failed=0
   if [[ -n "$target" ]]; then
     known_or_die "$target"
     installed "$target" || die "$target is not installed"
@@ -112,14 +172,25 @@ cmd_update() {
   for a in $list; do
     local old=$(version_of "$a")
     printf "%s updating %s%-10s%s " "$ARROW" "$BOLD" "$a" "$RST"
-    if ! run "$(field "$a" 3)"; then print -r -- "${RED}failed${RST}"; continue; fi
+    if ! run "$(field "$a" 3)"; then print -r -- "${RED}failed${RST}"; failed=1; continue; fi
     local new=$(version_of "$a")
+    if [[ -z "$new" ]]; then
+      print -r -- "${RED}could not read installed version${RST}"
+      failed=1
+      continue
+    fi
     if [[ "$old" == "$new" ]]; then
       print -r -- "${DIM}$new (up to date)${RST}"
     else
       print -r -- "$old ${GRN}→ $new${RST}"
     fi
+    if [[ "$a" == codex ]]; then
+      post_update_codex "$new" || failed=1
+    elif [[ "$old" != "$new" ]]; then
+      note "$a: restart existing sessions or separately managed servers to use $new"
+    fi
   done
+  return "$failed"
 }
 
 cmd_uninstall() {
