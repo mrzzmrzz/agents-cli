@@ -1,11 +1,11 @@
 # agents-cli
 
 A small CLI to install, update, and uninstall **Claude, Codex, Amp, Pi, and OpenCode**.
-One zsh script, using official native installers for Claude / Amp / OpenCode and npm for Codex / Pi.
+One zsh script, using official native installers for Claude / Codex / Amp / OpenCode and npm for Pi.
 
 ## Install
 
-Requires **zsh**, **bash**, and **curl**; **Node.js and npm** for Codex and Pi.
+Requires **zsh**, **bash**, and **curl**; **Node.js and npm** for Pi.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/mrzzmrzz/agents-cli/main/install.sh | bash
@@ -31,12 +31,28 @@ the active npm global root. Other layouts are rejected rather than modifying the
 wrong copy; use their original installer or fix `PATH`. The displayed channel is
 the supported channel, not automatic installation detection.
 
+Codex installs and updates use `curl -fsSL https://chatgpt.com/codex/install.sh | sh`
+with installer prompts disabled. `CODEX_HOME` and `CODEX_INSTALL_DIR` follow the
+official installer defaults (`~/.codex` and `~/.local/bin`). Uninstall removes only
+the standalone package and its launchers, preserving configuration and sessions.
+
+If Codex was previously installed through npm, migrate once with the official
+installer, then ensure its launcher precedes the npm command on `PATH`:
+
+```sh
+curl -fsSL https://chatgpt.com/codex/install.sh | sh
+export PATH="${CODEX_INSTALL_DIR:-$HOME/.local/bin}:$PATH"
+```
+
+Existing npm installations are not automatically removed. Custom services that
+launch an npm path must be updated to launch the standalone CLI.
+
 ## Updates and running agents
 
 - **Codex:** checks the local app server under `CODEX_HOME` (default `~/.codex`)
   after every update, including retries. A stale server is restarted and its version
-  verified; a stopped server is not started. Native daemon updates also prepare and
-  validate the separate standalone binary before restarting.
+  verified; a stopped server is not started. The CLI and native daemon share the
+  standalone installation managed by the official Codex installer.
 - **Service selection:** uses `AGENTS_CODEX_RESTART_CMD` if set, then an active
   `codex-app-server.service` (user manager, or system manager as root), otherwise
   the native daemon. Automatic systemd selection requires the default Codex home.

@@ -41,14 +41,17 @@ if name == "curl":
     finish()
 if name == "install-standalone":
     assert os.environ["CODEX_NON_INTERACTIVE"] == "1"
-    assert os.environ["CODEX_INSTALL_DIR"] in os.environ["PATH"].split(":")
-    if s.get("standalone_fail"): finish(1, "standalone install failed")
-    s["standalone"] = s.get("standalone_version", os.environ["CODEX_RELEASE"])
+    if s.get("standalone_fail") or s.get("update_fail") == "codex": finish(1, "standalone install failed")
+    s["codex"] = s["standalone"] = s.get("new_codex", "1.1.0")
     home = pathlib.Path(os.environ.get("CODEX_HOME", os.environ["HOME"] + "/.codex"))
     binary = home / "packages/standalone/current/bin/codex"
     binary.parent.mkdir(parents=True, exist_ok=True)
     binary.write_text(pathlib.Path(sys.argv[0]).read_text())
     binary.chmod(0o755)
+    launcher = pathlib.Path(os.environ.get("CODEX_INSTALL_DIR", os.environ["HOME"] + "/.local/bin")) / "codex"
+    launcher.parent.mkdir(parents=True, exist_ok=True)
+    if launcher.is_symlink(): launcher.unlink()
+    launcher.symlink_to(binary)
     finish()
 if name == "restart-codex": restart()
 if name == "systemctl":
@@ -64,12 +67,11 @@ if name == "npm":
     if s.get("update_fail") == agent: finish(1, "install failed")
     s[agent] = s.get("new_" + agent, s.get(agent, "1.0.0"))
     finish()
-managed = "standalone/current" in sys.argv[0]
 if args == ["--version"]:
-    finish(text=name + " " + s["standalone" if managed else name])
+    finish(text=name + " " + s[name])
 if name == "codex":
     if args == ["features", "list"]:
-        finish(1 if s.get("managed_config_fail" if managed else "config_fail") else 0, "config check")
+        finish(1 if s.get("config_fail") else 0, "config check")
     if args == ["app-server", "daemon", "restart"]: restart()
     if args == ["app-server", "daemon", "version"]:
         if s.get("status_fail"): finish(1, "status unavailable")
@@ -86,7 +88,7 @@ class UpdateTests(unittest.TestCase):
         # macOS's default TMPDIR is too long for a Unix socket pathname.
         self.temp = tempfile.TemporaryDirectory(prefix="agents-test-", dir="/tmp")
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.bin = self.root / "bin"
         self.bin.mkdir()
         self.home = self.root / "home"
@@ -108,8 +110,10 @@ class UpdateTests(unittest.TestCase):
     def install_mock(self, name):
         p = self.bin / name
         if name in ("codex", "pi"):
-            package = "@openai/codex" if name == "codex" else "@earendil-works/pi-coding-agent"
-            target = self.root / "node_modules" / package / "bin" / name
+            if name == "codex":
+                target = self.home / ".codex/packages/standalone/current/bin/codex"
+            else:
+                target = self.root / "node_modules/@earendil-works/pi-coding-agent/bin/pi"
             target.parent.mkdir(parents=True, exist_ok=True)
             p.symlink_to(target)
             p = target
@@ -137,7 +141,7 @@ class UpdateTests(unittest.TestCase):
         self.assertEqual(self.restarts(), [["codex", "app-server", "daemon", "restart"]])
         self.assertIn("1.1.0 verified", r.stdout)
 
-    def test_up_to_date_package_repairs_stale_server(self):
+    def test_up_to_date_cli_repairs_stale_server(self):
         self.state["codex"] = "1.1.0"
         r = self.run_update("codex")
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -156,6 +160,7 @@ class UpdateTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertFalse(self.restarts())
         self.assertFalse(any("app-server" in c for c in self.state["calls"]))
+        self.assertEqual(self.state["standalone"], "1.1.0")
 
     def test_update_failure_never_touches_server(self):
         self.state["update_fail"] = "codex"
@@ -215,11 +220,15 @@ class UpdateTests(unittest.TestCase):
 
     def test_custom_codex_home_avoids_default_systemd_service(self):
         self.env["CODEX_HOME"] = str(self.home / ".codex-custom")
+        old_home = self.home / ".codex"
+        old_home.rename(self.env["CODEX_HOME"])
+        (self.bin / "codex").unlink()
+        (self.bin / "codex").symlink_to(Path(self.env["CODEX_HOME"]) / "packages/standalone/current/bin/codex")
         self.socket.close()
         self.socket = socket.socket(socket.AF_UNIX)
         self.addCleanup(self.socket.close)
         p = Path(self.env["CODEX_HOME"]) / "app-server-control/app-server-control.sock"
-        p.parent.mkdir(parents=True)
+        p.unlink()
         self.socket.bind(str(p))
         self.state["manager"] = "user"
         r = self.run_update("codex")
@@ -243,7 +252,7 @@ class UpdateTests(unittest.TestCase):
         self.assertFalse(any(c[0] == "codex" for c in self.state["calls"]))
 
     def test_standalone_failures_preserve_server(self):
-        for failure in ("download_fail", "standalone_fail", "managed_config_fail"):
+        for failure in ("download_fail", "standalone_fail", "config_fail"):
             with self.subTest(failure=failure):
                 self.state[failure] = True
                 r = self.run_update("codex")
@@ -252,18 +261,13 @@ class UpdateTests(unittest.TestCase):
                 self.assertEqual(self.state["server"], "1.0.0")
                 del self.state[failure]
 
-    def test_standalone_version_mismatch_preserves_server(self):
-        self.state["standalone_version"] = "1.0.0"
-        r = self.run_update("codex")
-        self.assertNotEqual(r.returncode, 0)
-        self.assertIn("leaving server untouched", r.stderr)
-        self.assertFalse(self.restarts())
-
     def test_wrong_npm_prefix_blocks_update_and_uninstall(self):
+        self.install_mock("pi")
+        self.state["pi"] = "2.0.0"
         self.state["npm_root"] = str(self.root / "other-prefix/node_modules")
         for command in ("update", "uninstall"):
             with self.subTest(command=command):
-                r = self.run_agents(command, "codex", input="y\n")
+                r = self.run_agents(command, "pi", input="y\n")
                 self.assertNotEqual(r.returncode, 0)
                 self.assertIn("unsupported installation", r.stderr)
                 self.assertTrue(all(c == ["npm", "root", "-g"] for c in self.state["calls"]))
@@ -295,7 +299,31 @@ class UpdateTests(unittest.TestCase):
                     self.assertIn("1.2.3 installed", r.stdout)
                 (self.home / ".local/bin/claude").unlink()
 
-    def test_non_npm_binary_in_same_bin_directory_is_rejected(self):
+    def test_fresh_codex_install_prepares_standalone_without_npm(self):
+        (self.bin / "codex").unlink()
+        shutil.rmtree(self.home / ".codex/packages/standalone")
+        self.env["PATH"] = str(self.home / ".local/bin") + ":" + self.env["PATH"]
+        r = self.run_agents("install", "codex")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue((self.home / ".local/bin/codex").is_file())
+        self.assertFalse(any(c[0] == "npm" or "app-server" in c for c in self.state["calls"]))
+
+    def test_codex_uninstall_preserves_user_data_and_unrelated_launcher(self):
+        root = self.home / ".codex"
+        (root / "config.toml").write_text("user config")
+        launchers = self.home / ".local/bin"
+        launchers.mkdir(parents=True)
+        (launchers / "codex").symlink_to(self.bin / "codex")
+        helper = launchers / "codex-code-mode-host"
+        helper.write_text("unrelated executable")
+        r = self.run_agents("uninstall", "codex", input="y\n")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertFalse((root / "packages/standalone").exists())
+        self.assertFalse((launchers / "codex").is_symlink())
+        self.assertEqual(helper.read_text(), "unrelated executable")
+        self.assertEqual((root / "config.toml").read_text(), "user config")
+
+    def test_unmanaged_codex_binary_is_rejected(self):
         binary = self.bin / "codex"
         content = binary.read_text()
         binary.unlink()
@@ -304,7 +332,7 @@ class UpdateTests(unittest.TestCase):
         r = self.run_update("codex")
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("unsupported installation", r.stderr)
-        self.assertEqual(self.state["calls"], [["npm", "root", "-g"]])
+        self.assertEqual(self.state["calls"], [])
 
 
 if __name__ == "__main__":

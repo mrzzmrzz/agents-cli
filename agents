@@ -11,7 +11,7 @@ KNOWN=(claude codex amp pi opencode)
 meta() {
   case "$1" in
     claude)   echo 'native^curl -fsSL https://claude.ai/install.sh | bash^claude update^rm -rf ~/.local/share/claude ~/.local/bin/claude' ;;
-    codex)    echo 'npm^npm install -g @openai/codex@latest^npm install -g @openai/codex@latest^npm rm -g @openai/codex' ;;
+    codex)    echo 'native^curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh^curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh^uninstall_codex' ;;
     amp)      echo 'native^curl -fsSL https://ampcode.com/install.sh | bash^curl -fsSL https://ampcode.com/install.sh | bash^rm -rf ~/.amp ~/.local/bin/amp' ;;
     pi)       echo 'npm^npm install -g @earendil-works/pi-coding-agent@latest^npm install -g @earendil-works/pi-coding-agent@latest^npm rm -g @earendil-works/pi-coding-agent' ;;
     opencode) echo 'native^curl -fsSL https://opencode.ai/install | bash^opencode upgrade^rm -rf ~/.opencode ~/.local/bin/opencode' ;;
@@ -49,10 +49,12 @@ check_installation() {
   local actual=$(command -v "$1") expected root
   actual=${actual:A}
   case "$1" in
-    codex|pi)
+    codex)
+      root="${CODEX_HOME:-$HOME/.codex}/packages/standalone/current"
+      [[ "$actual" == "${root:A}/codex" || "$actual" == "${root:A}/bin/codex" ]] && return 0 ;;
+    pi)
       root=$(npm root -g) || return 1
-      if [[ "$1" == codex ]]; then expected="$root/@openai/codex"
-      else expected="$root/@earendil-works/pi-coding-agent"; fi
+      expected="$root/@earendil-works/pi-coding-agent"
       [[ "$actual" == "${expected:A}/"* ]] && return 0 ;;
     claude) [[ "$actual" == "$HOME/.local/share/claude/versions/"* || "$actual" == "$HOME/.local/bin/claude" ]] && return 0 ;;
     amp) [[ "$actual" == "$HOME/.amp/bin/amp" || "$actual" == "$HOME/.local/bin/amp" ]] && return 0 ;;
@@ -60,6 +62,18 @@ check_installation() {
   esac
   print -u2 -- "$1: unsupported installation at $actual; use its own installer or fix PATH"
   return 1
+}
+
+# Remove only installer-owned launchers; preserve config, auth, and sessions.
+uninstall_codex() {
+  local root="${CODEX_HOME:-$HOME/.codex}/packages/standalone" launcher
+  local bin_dir="${CODEX_INSTALL_DIR:-$HOME/.local/bin}"
+  for launcher in "$bin_dir/codex" "$bin_dir/codex-code-mode-host"; do
+    if [[ -L "$launcher" && "${launcher:A}" == "${root:A}/"* ]]; then
+      rm -f "$launcher" || return 1
+    fi
+  done
+  rm -rf "$root"
 }
 
 # Read the daemon's flat string fields (status/version, never arbitrary JSON).
@@ -77,18 +91,6 @@ restart_codex_server() {
        systemctl is-active --quiet codex-app-server.service 2>/dev/null; then
     run 'systemctl restart codex-app-server.service'
   else
-    # Native daemon restart uses the standalone install, not the npm CLI.
-    # Keep its launcher off the user's PATH and suppress installer prompts.
-    local -x CODEX_NON_INTERACTIVE=1 CODEX_RELEASE="$1"
-    local -x CODEX_INSTALL_DIR="${CODEX_HOME:-$HOME/.codex}/packages/standalone/bin"
-    run 'curl -fsSL https://chatgpt.com/codex/install.sh | PATH="$CODEX_INSTALL_DIR:$PATH" bash' || return 1
-    local managed="${CODEX_HOME:-$HOME/.codex}/packages/standalone/current/bin/codex"
-    [[ -x "$managed" ]] || managed="${CODEX_HOME:-$HOME/.codex}/packages/standalone/current/codex"
-    if [[ "$(version_of "$managed")" != "$1" ]]; then
-      print -u2 -- 'standalone Codex does not match the updated CLI; leaving server untouched'
-      return 1
-    fi
-    run "${(q)managed} features list" || return 1
     run 'codex app-server daemon restart'
   fi
 }
@@ -117,7 +119,7 @@ post_update_codex() {
   # Validate config with the new CLI before interrupting the existing server.
   run 'codex features list' || return 1
   note "restarting codex app-server ${running:-unknown} → $expected (active tasks may be interrupted)"
-  if ! restart_codex_server "$expected"; then
+  if ! restart_codex_server; then
     print -u2 -- 'codex updated, but app-server restart failed; check its service manager or set AGENTS_CODEX_RESTART_CMD'
     return 1
   fi
