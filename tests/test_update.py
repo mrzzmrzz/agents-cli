@@ -106,6 +106,15 @@ class UpdateTests(unittest.TestCase):
         self.socket_path = self.home / ".codex/app-server-control/app-server-control.sock"
         self.socket_path.parent.mkdir(parents=True)
         self.socket.bind(str(self.socket_path))
+        self.daemon_pid_path = self.home / ".codex/app-server-daemon/app-server.pid"
+        self.daemon_pid_path.parent.mkdir(parents=True)
+        self.daemon_record = {
+            "pid": os.getpid(),
+            "processStartTime": subprocess.check_output(
+                ["ps", "-p", str(os.getpid()), "-o", "lstart="],
+                env={**self.env, "LC_ALL": "C"}, text=True).strip(),
+        }
+        self.daemon_pid_path.write_text(json.dumps(self.daemon_record))
 
     def install_mock(self, name):
         p = self.bin / name
@@ -146,6 +155,54 @@ class UpdateTests(unittest.TestCase):
         r = self.run_update("codex")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(len(self.restarts()), 1)
+
+    def test_unmanaged_server_is_left_running_with_restart_guidance(self):
+        self.daemon_pid_path.unlink()
+        self.state["codex"] = "1.1.0"
+        r = self.run_update("codex")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertFalse(self.restarts())
+        self.assertEqual(self.state["server"], "1.0.0")
+        self.assertIn("app-server remains at 1.0.0", r.stdout)
+        self.assertIn("AGENTS_CODEX_RESTART_CMD", r.stdout)
+        self.assertNotIn("restarting codex app-server", r.stdout)
+        self.assertNotIn("verified", r.stdout)
+
+    def test_invalid_daemon_records_do_not_authorize_restart(self):
+        records = [
+            "not JSON",
+            json.dumps({**self.daemon_record, "pid": 999999999}),
+            json.dumps({**self.daemon_record, "pid": 0}),
+            json.dumps({**self.daemon_record, "pid": -1}),
+            json.dumps({**self.daemon_record, "processStartTime": "old process"}),
+            json.dumps({"pid": os.getpid()}),
+        ]
+        for record in records:
+            with self.subTest(record=record):
+                self.daemon_pid_path.write_text(record)
+                r = self.run_update("codex")
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertFalse(self.restarts())
+                self.assertEqual(self.state["server"], "1.0.0")
+                self.assertIn("app-server remains at 1.0.0", r.stdout)
+
+    def test_inactive_systemd_does_not_imply_native_daemon_ownership(self):
+        self.daemon_pid_path.unlink()
+        self.state["manager"] = "auto-restart"
+        r = self.run_update("codex")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertFalse(self.restarts())
+        self.assertEqual(self.state["server"], "1.0.0")
+
+    def test_batch_continues_with_unmanaged_server(self):
+        self.daemon_pid_path.unlink()
+        self.install_mock("pi")
+        self.state.update(pi="2.0.0", new_pi="2.1.0")
+        r = self.run_update()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertFalse(self.restarts())
+        self.assertEqual(self.state["pi"], "2.1.0")
+        self.assertEqual(self.state["server"], "1.0.0")
 
     def test_matching_versions_do_not_restart(self):
         self.state["codex"] = self.state["server"] = "1.1.0"
@@ -200,6 +257,7 @@ class UpdateTests(unittest.TestCase):
         self.assertFalse(self.restarts())
 
     def test_user_systemd_service(self):
+        self.daemon_pid_path.unlink()
         self.state["manager"] = "user"
         r = self.run_update("codex")
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -207,12 +265,14 @@ class UpdateTests(unittest.TestCase):
 
     @unittest.skipUnless(os.geteuid() == 0, "system service only used as root")
     def test_root_systemd_service(self):
+        self.daemon_pid_path.unlink()
         self.state["manager"] = "system"
         r = self.run_update("codex")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(self.restarts(), [["systemctl", "restart", "codex-app-server.service"]])
 
     def test_explicit_restart_command(self):
+        self.daemon_pid_path.unlink()
         self.env["AGENTS_CODEX_RESTART_CMD"] = "restart-codex"
         r = self.run_update("codex")
         self.assertEqual(r.returncode, 0, r.stderr)
