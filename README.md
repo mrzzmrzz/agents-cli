@@ -50,13 +50,19 @@ launch an npm path must be updated to launch the standalone CLI.
 ## Updates and running agents
 
 - **Codex:** checks the local app server under `CODEX_HOME` (default `~/.codex`)
-  after every update, including retries. A stale server is restarted and its version
-  verified; a stopped server is not started. The CLI and native daemon share the
+  after every update, including retries. A stale server with a detected restart
+  manager is restarted and its version verified; a stopped server is not started.
+  The CLI and native daemon share the
   standalone installation managed by the official Codex installer.
 - **Service selection:** uses `AGENTS_CODEX_RESTART_CMD` if set, then an active
-  `codex-app-server.service` (user manager, or system manager as root), otherwise
-  the native daemon. Automatic systemd selection requires the default Codex home.
+  `codex-app-server.service` (user manager, or system manager as root), then
+  the native daemon if its PID record matches a live process and its start time.
+  Automatic systemd selection requires the default Codex home.
   Custom/systemd services must launch the updated CLI.
+- **Unmanaged Codex servers:** a running socket alone does not establish daemon
+  ownership. If no restart manager is detected, the update succeeds with a reminder
+  showing the server's unchanged version. Restart it through its original launcher
+  after active tasks finish, or configure `AGENTS_CODEX_RESTART_CMD`.
 - **Other agents:** existing sessions and separately managed servers need their own
   restart. The CLI prints a reminder instead of terminating unknown processes.
 
