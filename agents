@@ -113,7 +113,15 @@ post_update_codex() {
     note 'codex app-server is not running locally; leaving it stopped'
     return 0
   fi
-  if ! info=$(codex app-server daemon version); then
+  if ! info=$(LC_ALL=C codex app-server daemon version 2>&1); then
+    # A daemon can exit without removing its socket file.
+    if [[ "$info" == *"failed to connect to ${CODEX_HOME:-$HOME/.codex}/app-server-control/app-server-control.sock"* &&
+          ( "$info" == *'Connection refused (os error 61)'* ||
+            "$info" == *'Connection refused (os error 111)'* ) ]]; then
+      note 'codex app-server is not running locally (stale socket); leaving it stopped'
+      return 0
+    fi
+    print -u2 -r -- "$info"
     print -u2 -- 'codex updated, but app-server status could not be checked'
     return 1
   fi

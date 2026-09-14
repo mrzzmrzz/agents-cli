@@ -12,7 +12,7 @@ import unittest
 AGENTS = Path(__file__).resolve().parents[1] / "agents"
 ZSH = shutil.which("zsh")
 MOCK = r'''
-import json, os, pathlib, sys
+import json, os, pathlib, socket, sys
 name = pathlib.Path(sys.argv[0]).name
 args = sys.argv[1:]
 p = pathlib.Path(os.environ["TEST_STATE"])
@@ -74,6 +74,19 @@ if name == "codex":
         finish(1 if s.get("config_fail") else 0, "config check")
     if args == ["app-server", "daemon", "restart"]: restart()
     if args == ["app-server", "daemon", "version"]:
+        if s.get("socket_probe"):
+            home = os.environ.get("CODEX_HOME", os.environ["HOME"] + "/.codex")
+            socket_path = home + "/app-server-control/app-server-control.sock"
+            with socket.socket(socket.AF_UNIX) as client:
+                try:
+                    client.connect(socket_path)
+                except OSError as error:
+                    print(f"Error: failed to connect to {socket_path}\n\nCaused by:\n"
+                          f"    {error.strerror} (os error {error.errno})", file=sys.stderr)
+                    finish(1)
+        if s.get("status_error"):
+            print(s["status_error"], file=sys.stderr)
+            finish(1)
         if s.get("status_fail"): finish(1, "status unavailable")
         finish(text=json.dumps({"status": s.get("status", "running"),
                                "cliVersion": s["codex"],
@@ -224,6 +237,39 @@ class UpdateTests(unittest.TestCase):
         r = self.run_update("codex")
         self.assertNotEqual(r.returncode, 0)
         self.assertFalse(any("app-server" in c for c in self.state["calls"]))
+
+    def test_stale_socket_is_left_stopped(self):
+        self.socket.close()
+        self.state["socket_probe"] = True
+        r = self.run_update("codex")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("stale socket", r.stdout)
+        self.assertEqual(r.stderr, "")
+        self.assertEqual(self.state["standalone"], "1.1.0")
+        self.assertFalse(self.restarts())
+        self.assertTrue(self.socket_path.exists())
+
+    def test_connection_refused_on_macos_and_linux(self):
+        self.state["codex"] = "1.1.0"
+        for errno in (61, 111):
+            with self.subTest(errno=errno):
+                self.state["status_error"] = (
+                    f"Error: failed to connect to {self.socket_path}\n\n"
+                    f"Caused by:\n    Connection refused (os error {errno})")
+                r = self.run_update("codex")
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertIn("stale socket", r.stdout)
+                self.assertEqual(r.stderr, "")
+                self.assertFalse(self.restarts())
+
+    def test_other_connection_errors_are_reported(self):
+        for error in ("Permission denied (os error 13)", "Connection reset by peer (os error 54)"):
+            with self.subTest(error=error):
+                self.state["status_error"] = f"Error: failed to connect to {self.socket_path}\n{error}"
+                r = self.run_update("codex")
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn(error, r.stderr)
+                self.assertFalse(self.restarts())
 
     def test_config_failure_preserves_running_server(self):
         self.state["config_fail"] = True
