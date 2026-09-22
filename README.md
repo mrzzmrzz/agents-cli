@@ -1,7 +1,7 @@
 # agents-cli
 
-A small CLI to install, update, and uninstall **Claude, Codex, Amp, Pi, and OpenCode**.
-One zsh script, using official native installers for Claude / Codex / Amp / OpenCode and npm for Pi.
+A small CLI to install, update, and uninstall **Claude, Codex, Amp, Pi, and Cursor Agent**.
+One zsh script, using official native installers for Claude / Codex / Amp / Cursor Agent and npm for Pi.
 
 ## Install
 
@@ -46,6 +46,12 @@ export PATH="${CODEX_INSTALL_DIR:-$HOME/.local/bin}:$PATH"
 
 Existing npm installations are not automatically removed. Custom services that
 launch an npm path must be updated to launch the standalone CLI.
+
+Cursor Agent installs with `curl -fsSL https://cursor.com/install | bash`.
+The command registered here is `cursor-agent`; the official installer also links
+`agent` to the same binary under `~/.local/share/cursor-agent`. Updates use
+`cursor-agent update`. Uninstall removes that package directory and only the
+`cursor-agent` and `agent` launchers that point into it, preserving `~/.cursor`.
 
 ## Updates and running agents
 

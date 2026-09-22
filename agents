@@ -6,7 +6,7 @@ set -uo pipefail
 # ── registry ──────────────────────────────────────────────────────────
 # One line of metadata per agent: via^install^update^uninstall
 # To add an agent, add one line to KNOWN and one to meta()
-KNOWN=(claude codex amp pi opencode)
+KNOWN=(claude codex amp pi cursor-agent)
 
 meta() {
   case "$1" in
@@ -14,7 +14,7 @@ meta() {
     codex)    echo 'native^curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh^curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh^uninstall_codex' ;;
     amp)      echo 'native^curl -fsSL https://ampcode.com/install.sh | bash^curl -fsSL https://ampcode.com/install.sh | bash^rm -rf ~/.amp ~/.local/bin/amp' ;;
     pi)       echo 'npm^npm install -g @earendil-works/pi-coding-agent@latest^npm install -g @earendil-works/pi-coding-agent@latest^npm rm -g @earendil-works/pi-coding-agent' ;;
-    opencode) echo 'native^curl -fsSL https://opencode.ai/install | bash^opencode upgrade^rm -rf ~/.opencode ~/.local/bin/opencode' ;;
+    cursor-agent) echo 'native^curl -fsSL https://cursor.com/install | bash^cursor-agent update^uninstall_cursor_agent' ;;
     *)        return 1 ;;
   esac
 }
@@ -58,7 +58,7 @@ check_installation() {
       [[ "$actual" == "${expected:A}/"* ]] && return 0 ;;
     claude) [[ "$actual" == "$HOME/.local/share/claude/versions/"* || "$actual" == "$HOME/.local/bin/claude" ]] && return 0 ;;
     amp) [[ "$actual" == "$HOME/.amp/bin/amp" || "$actual" == "$HOME/.local/bin/amp" ]] && return 0 ;;
-    opencode) [[ "$actual" == "$HOME/.opencode/bin/opencode" || "$actual" == "$HOME/.local/bin/opencode" ]] && return 0 ;;
+    cursor-agent) [[ "$actual" == "$HOME/.local/share/cursor-agent/versions/"* || "$actual" == "$HOME/.local/bin/cursor-agent" ]] && return 0 ;;
   esac
   print -u2 -- "$1: unsupported installation at $actual; use its own installer or fix PATH"
   return 1
@@ -69,6 +69,18 @@ uninstall_codex() {
   local root="${CODEX_HOME:-$HOME/.codex}/packages/standalone" launcher
   local bin_dir="${CODEX_INSTALL_DIR:-$HOME/.local/bin}"
   for launcher in "$bin_dir/codex" "$bin_dir/codex-code-mode-host"; do
+    if [[ -L "$launcher" && "${launcher:A}" == "${root:A}/"* ]]; then
+      rm -f "$launcher" || return 1
+    fi
+  done
+  rm -rf "$root"
+}
+
+# Remove installer-owned launchers only. Keep ~/.cursor (auth and sessions).
+uninstall_cursor_agent() {
+  local root="$HOME/.local/share/cursor-agent" launcher
+  local bin_dir="$HOME/.local/bin"
+  for launcher in "$bin_dir/cursor-agent" "$bin_dir/agent"; do
     if [[ -L "$launcher" && "${launcher:A}" == "${root:A}/"* ]]; then
       rm -f "$launcher" || return 1
     fi
@@ -178,7 +190,7 @@ cmd_show() {
     installed "$a" || continue
     found=1
     local p=$(readlink -f "$(command -v "$a")")
-    printf "%s %s%-10s%s %s%-${vw}s%s %s%-8s%s %s\n" \
+    printf "%s %s%-12s%s %s%-${vw}s%s %s%-8s%s %s\n" \
       "$OK" "$BOLD" "$a" "$RST" "$GRN" "$(version_of "$a")" "$RST" \
       "$DIM" "$(field "$a" 1)" "$RST" "$(tilde "$p")"
   done
@@ -189,10 +201,10 @@ cmd_list() {
   local vw=$(ver_width)
   for a in $KNOWN; do
     if installed "$a"; then
-      printf "%s %s%-10s%s %s%-${vw}s%s %s%s%s\n" \
+      printf "%s %s%-12s%s %s%-${vw}s%s %s%s%s\n" \
         "$OK" "$BOLD" "$a" "$RST" "$GRN" "$(version_of "$a")" "$RST" "$DIM" "$(field "$a" 1)" "$RST"
     else
-      printf "%s %s%-10s %-${vw}s %s%s\n" "$NOPE" "$DIM" "$a" "—" "$(field "$a" 2)" "$RST"
+      printf "%s %s%-12s %-${vw}s %s%s\n" "$NOPE" "$DIM" "$a" "—" "$(field "$a" 2)" "$RST"
     fi
   done
 }
@@ -234,7 +246,7 @@ cmd_update() {
   for a in $list; do
     check_installation "$a" || { failed=1; continue; }
     local old=$(version_of "$a")
-    printf "%s updating %s%-10s%s " "$ARROW" "$BOLD" "$a" "$RST"
+    printf "%s updating %s%-12s%s " "$ARROW" "$BOLD" "$a" "$RST"
     if ! run "$(field "$a" 3)"; then print -r -- "${RED}failed${RST}"; failed=1; continue; fi
     local new=$(version_of "$a")
     if [[ -z "$new" ]]; then
