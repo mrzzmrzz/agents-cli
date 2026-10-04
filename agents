@@ -734,23 +734,44 @@ cmd_usage() {
   usage_report "${roots[@]}" -- "$@"
 }
 
+# A titled block of "left^right" rows with the right column at width w; the left is
+# "<word> <args>", shown as a coloured word and dimmed args.
+help_section() {
+  local title=$1 w=$2 row left; shift 2
+  print -r -- "${BOLD}$title${RST}"
+  for row in "$@"; do
+    left=${row%%^*}
+    printf "  %s%s%s%s%s%s%*s  %s\n" "$CYN" "${left%% *}" "$RST" "$DIM" "${left#${left%% *}}" "$RST" \
+      $(( w - ${#left} )) "" "${row#*^}"
+  done
+}
+
 cmd_help() {
-  cat <<EOF
-${BOLD}agents${RST} — minimal AI coding-agent manager
-
-  ${CYN}agents${RST} ${DIM}[show]${RST}           installed agents (version / channel / path)
-  ${CYN}agents list${RST}             all supported agents and their status
-  ${CYN}agents install${RST} <x|all>  install
-  ${CYN}agents update${RST} ${DIM}[x]${RST}       update everything, or just x
-  ${CYN}agents uninstall${RST} <x>    uninstall (asks for confirmation)
-
-  ${CYN}agents sync${RST} ${DIM}[agent] [host]${RST}  archive sessions from configured hosts
-  ${CYN}agents usage${RST} ${DIM}[options]${RST}      token usage and cost across archived sessions
-      ${DIM}daily|weekly|monthly|total   [agent] [host]   --by agent,host,model|none
-      --since/--until YYYY-MM-DD    --json    --no-cost${RST}
-
-  ${DIM}aliases: ls=list  up=update  rm=uninstall${RST}
-EOF
+  local agents=(
+    "show^installed agents: version, channel, path (default)"
+    "list^all supported agents and their status"
+    "install <x|all>^install one agent, or every missing one"
+    "update [x]^update everything, or just x"
+    "uninstall <x>^uninstall (asks for confirmation)"
+  ) sessions=(
+    "sync [agent] [host]^archive sessions from configured hosts"
+    "usage [options]^token usage and estimated cost"
+  ) options=(
+    "daily|weekly|monthly|total^period (default: monthly)"
+    "<agent> <host>^only these agents or hosts"
+    "--by agent,host,model|none^group rows (default: agent)"
+    "--since / --until <date>^inclusive range, YYYY-MM-DD"
+    "--json^machine-readable output"
+    "--no-cost^skip pricing"
+  )
+  local row w=0  # one description column for every section
+  for row in $agents $sessions $options; do (( ${#row%%^*} > w )) && w=${#row%%^*}; done
+  print -r -- "${BOLD}agents${RST} — minimal AI coding-agent manager"
+  print -r -- "${DIM}usage: agents <command> [args]${RST}"
+  print; help_section "Agents" $w $agents
+  print; help_section "Sessions" $w $sessions
+  print; help_section "Usage options" $w $options
+  print; print -r -- "${DIM}aliases: ls=list  up=update  rm=uninstall${RST}"
 }
 
 # ── dispatch ──────────────────────────────────────────────────────────
