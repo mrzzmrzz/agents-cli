@@ -1,6 +1,7 @@
 # agents-cli
 
-A small CLI to install, update, and uninstall **Claude, Codex, Amp, Pi, and Cursor Agent**.
+A small CLI to install, update, and uninstall **Claude, Codex, Amp, Pi, and Cursor Agent**,
+and to archive their sessions across machines and report token usage.
 One zsh script, using official native installers for Claude / Codex / Amp / Cursor Agent and npm for Pi.
 
 ## Install
@@ -22,6 +23,8 @@ agents list             List all supported agents
 agents install <x|all>  Install one agent or all missing agents
 agents update [x]       Update one agent or all installed agents
 agents uninstall <x>    Uninstall an agent (asks for confirmation)
+agents sync [agent] [host]   Archive sessions from configured hosts
+agents usage [options]       Token usage and cost across sessions
 ```
 
 Aliases: `ls` → `list`, `up` → `update`, `rm` → `uninstall`.
@@ -83,6 +86,74 @@ are not managed. Batch updates continue after failures and return a nonzero exit
 if any update or verification fails. Use cron or a systemd timer for periodic runs;
 `agents` does not install a scheduler.
 
+## Sessions: sync and usage
+
+```
+agents sync [agent] [host]   Archive Claude / Codex sessions from your machines
+agents usage [options]       Token usage and estimated cost across the archive
+```
+
+`agents sync` copies each host's session logs into one archive directory (a synced
+folder such as OneDrive or Dropbox works well), one rsync per host over SSH. It is
+one-way: sessions deleted on a host, for example by the agent's own cleanup, stay in
+the archive, while a file that changes on the host replaces its archived copy. Only
+session data is copied, never credentials or settings:
+
+| Agent  | Archived from the agent's home |
+|--------|--------------------------------|
+| claude | `~/.claude/projects` (transcripts and per-project memory), `history.jsonl` |
+| codex  | `~/.codex/sessions`, `archived_sessions`, `memories`, `history.jsonl`, `session_index.jsonl`, `AGENTS.md` |
+
+The archive mirrors these paths as `<archive>/hosts/<host>/.claude/…` and `.codex/…`;
+an item that is a symlink to somewhere outside the agent's home is archived as content.
+
+Hosts are configured per machine in `~/.config/agents/sync.conf` (or
+`$AGENTS_SYNC_CONFIG`), never in this repository:
+
+```
+archive ~/OneDrive/agents          # where sessions are archived
+self    laptop                     # this machine; read from $HOME, not over SSH
+rsync   /opt/homebrew/bin/rsync    # optional: the local rsync
+host    laptop       100.64.0.1    /opt/homebrew/bin/rsync
+host    workstation  100.64.0.2    /opt/homebrew/bin/rsync
+host    gpu-box      gpu-box       # any ssh target, including ~/.ssh/config aliases
+```
+
+A host line's optional third field is the rsync on that host. Sync needs rsync 3.x
+on both ends; macOS ships `openrsync` at `/usr/bin/rsync`, so point Macs at
+Homebrew's (`AGENTS_RSYNC` overrides the local one too). SSH must work
+non-interactively (keys; host keys already accepted). Host names cannot be a period
+or agent name. Run `agents sync` from one machine at a time, so the synced folder
+never sees two writers of one file.
+
+`agents usage` reads the archive (or this machine's own sessions when sync is not
+configured) and reports tokens and estimated API cost:
+
+```
+agents usage                          # monthly, per agent
+agents usage daily --since 2026-09-01
+agents usage total --by host,model
+agents usage codex workstation weekly --json
+```
+
+Periods are `daily`, `weekly` (labelled by their Monday), `monthly` (default) and
+`total`, in this machine's time zone; `--since`/`--until` are inclusive days. `--by`
+groups by any of `agent`, `host`, `model` (or `none`); agent and host names filter.
+
+Each model response is counted once, at its final usage, wherever it was logged:
+Claude Code writes a response once per content block (only the last carries the
+final output count), and Codex sub-agents and forks replay their parent's history;
+a replayed response stays on the day it actually happened (with `--since`, a parent
+file untouched since then is skipped, so its replay may count on the replay day).
+Malformed lines are ignored; unreadable files are skipped with a warning.
+
+Costs are estimates from [LiteLLM's price table](https://github.com/BerriAI/litellm),
+downloaded from GitHub at most once a day into `~/.cache/agents` (`AGENTS_PRICING`
+points at a local copy instead; `--no-cost` skips pricing). Long-context tiers and
+1-hour cache writes are priced separately; models missing from the table are listed
+as unpriced. Parsing runs on every CPU core, and `--since` skips files untouched
+since then; installing `orjson` makes it faster still. Requires **python3** (3.8+).
+
 ## Tests
 
 ```sh
@@ -90,4 +161,4 @@ python3 -m unittest discover -s tests -v
 ```
 
 Tests use temporary files, fake CLIs, and Unix sockets; no real packages or services
-are changed. Python is only required for tests.
+are changed. Sync tests need rsync 3.x.

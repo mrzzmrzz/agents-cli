@@ -19,6 +19,19 @@ meta() {
   esac
 }
 
+# Session data for `agents sync` / `agents usage`: home^items under that home.
+# To track another agent, add a line here and a parser to PARSERS in usage_report.
+sessions_of() {
+  case "$1" in
+    claude) echo '.claude^projects history.jsonl' ;;
+    codex)  echo '.codex^sessions archived_sessions memories history.jsonl session_index.jsonl AGENTS.md' ;;
+    *)      return 1 ;;
+  esac
+}
+session_home() { local s=$(sessions_of "$1"); print -r -- "${s%%^*}"; }
+SESSION_AGENTS=()
+for a in $KNOWN; do sessions_of "$a" >/dev/null && SESSION_AGENTS+=("$a"); done
+
 # ── ui ────────────────────────────────────────────────────────────────
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
   BOLD=$'\e[1m' DIM=$'\e[2m' RST=$'\e[0m'
@@ -183,6 +196,411 @@ ver_width() {
   echo $w
 }
 
+# ── sessions: sync & usage ────────────────────────────────────────────
+# Machine-specific settings live outside this script (see README):
+#   archive <dir>                    where sessions are archived
+#   self    <name>                   this machine's host name (synced from $HOME)
+#   rsync   <path>                   local rsync 3.x (default: rsync on PATH)
+#   host    <name> <ssh-target> [remote rsync path]
+SYNC_CONF="${AGENTS_SYNC_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/agents/sync.conf}"
+PERIODS=(daily weekly monthly total)
+ARCHIVE='' SELF='' LOCAL_RSYNC='' HOSTS=()
+typeset -A HOST_ADDR HOST_RSYNC
+
+load_sync_conf() {
+  [[ -r "$SYNC_CONF" ]] || die "no sync config at $(tilde "$SYNC_CONF") ${DIM}(see README: Sessions)${RST}"
+  local line key rest name target rpath extra
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line=${line%$'\r'}                      # tolerate CRLF files
+    read -r key rest <<< "${line%%[[:space:]]\#*}"  # a comment starts with whitespace + #
+    case "$key" in
+      ''|'#'*) ;;
+      archive) ARCHIVE=${rest/#\~/$HOME} ;;
+      self)    SELF=$rest ;;
+      rsync)   LOCAL_RSYNC=${rest/#\~/$HOME} ;;
+      host)    read -r name target rpath extra <<< "$rest"
+               [[ -n "$target" && -z "$extra" ]] || die "sync.conf: expected 'host <name> <ssh-target> [rsync path]': $line"
+               (( ${PERIODS[(Ie)$name]} || ${SESSION_AGENTS[(Ie)$name]} )) &&
+                 die "sync.conf: host name '$name' is reserved (a period or agent name)"
+               HOSTS+=("$name"); HOST_ADDR[$name]=$target; HOST_RSYNC[$name]=${rpath:-rsync} ;;
+      *)       die "sync.conf: unknown setting '$key'" ;;
+    esac
+  done < "$SYNC_CONF"
+  [[ -n "$ARCHIVE" ]] || die "sync.conf: missing 'archive <dir>'"
+}
+
+human_bytes() {
+  local -F n=$1; local u
+  for u in B KB MB GB TB; do (( n < 1000 )) && break; (( n /= 1000 )); done
+  [[ $u == B ]] && printf '%d B' $n || printf '%.1f %s' $n $u
+}
+
+# Mirrors each agent's session items into $ARCHIVE/hosts/<host>/<agent home>/.
+# One-way: files deleted on the host stay in the archive.
+sync_host() {
+  local rsync=$1 host=$2 a i spec src=() out rc files bytes; shift 2
+  # --relative keeps paths below the anchor: $HOME/./ locally, the login dir remotely
+  local from="$HOME/./" opts=()
+  if [[ $host != "$SELF" ]]; then
+    from="${HOST_ADDR[$host]}:" opts=(-z --rsync-path="${HOST_RSYNC[$host]}")
+  fi
+  for a in "$@"; do
+    spec=$(sessions_of "$a")
+    for i in ${=spec#*^}; do src+=("$from$(session_home "$a")/$i"); done
+  done
+  local dst="$ARCHIVE/hosts/$host/"
+  printf "%s %s%-12s%s %s%-14s%s " "$ARROW" "$BOLD" "$host" "$RST" "$DIM" "$*" "$RST"
+  # --copy-unsafe-links: an item that links outside its home (e.g. a shared memories
+  # dir) is archived as content; --ignore-missing-args: absent agents are not errors
+  mkdir -p "$dst" &&
+  out=$("$rsync" -aR --copy-unsafe-links --partial --timeout=120 --ignore-missing-args \
+        --no-owner --no-group --stats "${opts[@]}" \
+        -e "ssh -o BatchMode=yes -o ConnectTimeout=15" "${src[@]}" "$dst" 2>&1)
+  rc=$?
+  printf '%s\t%s\t%s\t%s\t%s\n' "$(date '+%F %T')" "${SELF:-$(hostname -s)}" "$host" "$*" \
+    "$( (( rc )) && echo failed || echo ok)" >> "$ARCHIVE/archive.log"
+  if (( rc )); then
+    print -r -- "${RED}failed${RST}"; print -r -- "$out" | tail -5 >&2; return 1
+  fi
+  files=${${(M)${(f)out}:#Number of regular files transferred:*}##*: }
+  bytes=${${${(M)${(f)out}:#Total transferred file size:*}##*: }%% *}
+  if [[ ${files//,/} == 0 ]]; then print -r -- "${DIM}up to date${RST}"
+  else print -r -- "${GRN}${files} file$( [[ $files == 1 ]] || echo s)${RST} ${DIM}$(human_bytes ${bytes//,/})${RST}"; fi
+}
+
+# Token usage across session roots ("agent:host:dir" ...) -- [report args].
+usage_report() {
+  python3 - "$@" <<'PY'
+import datetime as dt, functools, json, mmap, multiprocessing as mp, os, re, sys, time, urllib.request
+from collections import defaultdict
+
+try:
+    from orjson import loads  # optional, ~2x faster; the stdlib parser is the fallback
+except ImportError:
+    loads = json.loads
+
+# ── parsing ──
+# A session log is scanned in C; only the few lines that carry usage are copied out
+# and decoded.
+def lines(buf, pattern):
+    end = -1
+    for m in pattern.finditer(buf):
+        if m.start() < end:
+            continue  # same line as the previous match
+        start = buf.rfind(b"\n", 0, m.start()) + 1
+        end = buf.find(b"\n", m.end())
+        end = len(buf) if end < 0 else end
+        yield buf[start:end]
+
+def objects(buf, pattern):
+    for line in lines(buf, pattern):
+        try:
+            d = loads(line)
+        except ValueError:
+            continue
+        if isinstance(d, dict):
+            yield d
+
+def n(x):
+    return x if type(x) is int and x > 0 else 0
+
+def obj(x):
+    return x if isinstance(x, dict) else {}
+
+# A parser yields (key | None, ISO timestamp, model, usage) per model response, where
+# usage is (uncached input, cache write, of which 1h-TTL, cache read, output). Records
+# sharing a key are one response: usage merges by maximum, the earliest copy dates it.
+CLAUDE_USAGE = re.compile(rb'"usage":\s*\{')
+CODEX_EVENTS = re.compile(rb'"type":\s*"(?:token_count|turn_context)"')
+CODEX_FIELDS = ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens", "total_tokens")
+
+def claude(buf):
+    # A response is logged once per content block; output_tokens grows from a
+    # streaming placeholder to the final count, hence the max-merge.
+    for d in objects(buf, CLAUDE_USAGE):
+        m = obj(d.get("message"))
+        u = m.get("usage")
+        if not isinstance(u, dict) or m.get("model") == "<synthetic>":
+            continue
+        yield (m.get("id"), d.get("timestamp"), m.get("model"),
+               (n(u.get("input_tokens")), n(u.get("cache_creation_input_tokens")),
+                n(obj(u.get("cache_creation")).get("ephemeral_1h_input_tokens")),
+                n(u.get("cache_read_input_tokens")), n(u.get("output_tokens"))))
+
+def codex(buf):
+    # Repeats share the (running total, this response) fingerprint: re-sent events,
+    # and the parent history that sub-agent threads and forks replay (re-stamped).
+    # Their subagent_history_start_ordinal counts the parent's events, not the
+    # child's own lines, so it cannot mark where a replay ends.
+    model, pending = None, []
+    for d in objects(buf, CODEX_EVENTS):
+        p = obj(d.get("payload"))
+        if d.get("type") == "turn_context":
+            model = p.get("model") or model
+            yield from ((k, ts, model, u) for k, ts, _, u in pending)  # model announced late
+            pending = []
+            continue
+        info = obj(p.get("info")) if p.get("type") == "token_count" else {}
+        last, total = obj(info.get("last_token_usage")), obj(info.get("total_token_usage"))
+        if not last:
+            continue
+        key = tuple(n(total.get(f)) for f in CODEX_FIELDS) + tuple(n(last.get(f)) for f in CODEX_FIELDS)
+        cached = n(last.get("cached_input_tokens"))
+        rec = (key, d.get("timestamp"), model,
+               (max(n(last.get("input_tokens")) - cached, 0), 0, 0, cached, n(last.get("output_tokens"))))
+        if model is None:
+            pending.append(rec)
+        else:
+            yield rec
+    yield from pending
+
+# agent -> (parser, session subdirectories under the agent's home)
+PARSERS = {"claude": (claude, "projects"), "codex": (codex, "sessions", "archived_sessions")}
+TIMESTAMP = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d(?::[\d.]+)?(Z|[+-]\d\d:\d\d)?$")
+
+def utc_minute(ts):
+    """'YYYY-MM-DDTHH:MM' in UTC, or None. Both agents write UTC; offsets are converted."""
+    m = TIMESTAMP.match(ts) if isinstance(ts, str) else None
+    if not m:
+        return None
+    if m[1] in (None, "Z", "+00:00"):
+        return ts[:16]
+    when = dt.datetime.strptime(ts[:16] + m[1].replace(":", ""), "%Y-%m-%dT%H:%M%z")
+    return when.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M")
+
+def merge(a, b):
+    return tuple(map(max, a, b))
+
+def parse_file(task):
+    """Worker: one file -> (error, [(key, utc minute, model, usage, cost)]), with the
+    file's own duplicates already merged."""
+    agent, _, path = task
+    found, loose = {}, []
+    try:
+        with open(path, "rb") as f:
+            # one read is fastest for typical logs; mmap keeps memory flat for huge ones
+            size = os.fstat(f.fileno()).st_size
+            buf = f.read() if size <= 16 << 20 else mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+            for key, ts, model, u in PARSERS[agent][0](buf):
+                minute = utc_minute(ts)
+                if minute is None or not any(u):
+                    continue
+                rec = (minute, model if isinstance(model, str) else "unknown", u)
+                if not isinstance(key, (str, tuple)):
+                    loose.append((None, *rec))
+                    continue
+                old = found.get(key)
+                if old is not None:  # the earliest copy names the model; usage takes the max
+                    rec = (*min(old[:2], rec[:2]), merge(old[2], u))
+                found[key] = rec
+    except (OSError, ValueError) as e:
+        return f"{path}: {e}", []
+    return None, [(k, m, model, u, COST(model, u))
+                  for k, m, model, u in [(k, *v) for k, v in found.items()] + loose]
+
+# ── pricing (LiteLLM model table, cached for a day) ──
+PRICING_URL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
+RATE_KEYS = ("input_cost_per_token", "cache_creation_input_token_cost", "cache_read_input_token_cost", "output_cost_per_token")
+
+def load_pricing():
+    if os.environ.get("AGENTS_PRICING"):
+        with open(os.environ["AGENTS_PRICING"]) as f:
+            return json.load(f)
+    cache = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "agents", "pricing.json")
+    try:
+        fresh = time.time() - os.path.getmtime(cache) < 86400
+    except OSError:
+        fresh = False
+    if not fresh:
+        try:
+            # env-only proxies: macOS's system proxy lookup is unsafe in a process that forks
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler(urllib.request.getproxies_environment()))
+            with opener.open(PRICING_URL, timeout=10) as r:
+                data = r.read()
+            json.loads(data)
+            os.makedirs(os.path.dirname(cache), exist_ok=True)
+            with open(cache + ".tmp", "wb") as f:
+                f.write(data)
+            os.replace(cache + ".tmp", cache)
+        except (OSError, ValueError):
+            pass  # offline: a stale cache still beats no prices
+    try:
+        with open(cache) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+def pricer(table):
+    @functools.lru_cache(maxsize=None)
+    def tiers(model):
+        """[(prompt-size threshold, rates)], highest first; None if the model is unpriced."""
+        p = table.get(model)
+        if not isinstance(p, dict) or p.get("input_cost_per_token") is None:
+            return None
+        def rates(suffix=""):
+            inp, cw, cr, out = (p.get(k + suffix, p.get(k)) for k in RATE_KEYS)
+            cw = cw if cw is not None else inp
+            cr = cr if cr is not None else inp / 10  # typical cached-input discount
+            return inp, cw, p.get("cache_creation_input_token_cost_above_1hr") or cw, cr, out or 0
+        found = (re.fullmatch(r"input_cost_per_token(_above_(\d+)k_tokens)", k) for k in p)
+        return sorted([(int(m[2]) * 1000, rates(m[1])) for m in found if m] + [(0, rates())], reverse=True)
+    def cost(model, u):
+        t = tiers(model)
+        if t is None:
+            return None
+        prompt = u[0] + u[1] + u[3]
+        r = next(r for limit, r in t if prompt > limit or limit == 0)
+        return u[0] * r[0] + (u[1] - u[2]) * r[1] + u[2] * r[2] + u[3] * r[3] + u[4] * r[4]
+    return cost
+
+# ── report ──
+PERIODS = {
+    "daily":   lambda d: d.isoformat(),
+    "weekly":  lambda d: (d - dt.timedelta(days=d.weekday())).isoformat(),  # Monday
+    "monthly": lambda d: d.strftime("%Y-%m"),
+    "total":   lambda d: "total",
+}
+DIMS = ("agent", "host", "model")
+
+@functools.lru_cache(maxsize=None)
+def local_day(minute):
+    utc = dt.datetime.strptime(minute, "%Y-%m-%dT%H:%M").replace(tzinfo=dt.timezone.utc)
+    return utc.astimezone().date()
+
+def fail(msg):
+    sys.exit(f"agents usage: {msg}")
+
+def date_arg(s):
+    try:
+        return dt.date.fromisoformat(s if "-" in s else f"{s[:4]}-{s[4:6]}-{s[6:]}")
+    except ValueError:
+        fail(f"bad date '{s}' (YYYY-MM-DD)")
+
+def parse_args(argv, roots):
+    o = dict(period="monthly", by=["agent"], agents=set(), hosts=set(), since=None, until=None, json=False, cost=True)
+    hosts = {r[1] for r in roots}
+    it = iter(argv)
+    for a in it:
+        if a in PERIODS: o["period"] = a
+        elif a in PARSERS: o["agents"].add(a)
+        elif a in hosts: o["hosts"].add(a)
+        elif a == "--json": o["json"] = True
+        elif a == "--no-cost": o["cost"] = False
+        elif a in ("--since", "--until"): o[a[2:]] = date_arg(next(it, ""))
+        elif a == "--by":
+            value = next(it, "")
+            o["by"] = [] if value == "none" else value.split(",")
+            if not value or set(o["by"]) - set(DIMS):
+                fail(f"--by takes a comma list of {', '.join(DIMS)}, or none")
+        else:
+            fail(f"unknown argument '{a}' (periods: {' '.join(PERIODS)}; agents: {' '.join(PARSERS)}; "
+                 f"hosts: {' '.join(sorted(hosts)) or 'none archived'})")
+    return o
+
+def session_files(roots, since):
+    # rsync keeps mtimes, so a file last written before --since holds nothing newer
+    floor = time.mktime(since.timetuple()) if since else 0
+    for agent, host, home in roots:
+        for sub in PARSERS[agent][1:]:
+            for dirpath, dirs, names in os.walk(os.path.join(home, sub)):
+                dirs.sort()
+                for name in sorted(names):
+                    path = os.path.join(dirpath, name)
+                    if name.endswith(".jsonl") and os.path.getmtime(path) >= floor:
+                        yield agent, host, path
+
+def human(n):
+    for unit in ("", "K", "M", "B"):
+        if abs(n) < 1000:
+            return f"{n:.0f}{unit}" if not unit else f"{n:.1f}{unit}"
+        n /= 1000
+    return f"{n:.1f}T"
+
+def main():
+    global COST  # workers inherit it when the pool forks
+    split = sys.argv.index("--")
+    roots = [r.split(":", 2) for r in sys.argv[1:split]]
+    o = parse_args(sys.argv[split + 1:], roots)
+    COST = pricer(load_pricing() or {}) if o["cost"] else (lambda m, u: 0.0)
+    roots = [r for r in roots if r[0] in PARSERS and (not o["agents"] or r[0] in o["agents"])
+             and (not o["hosts"] or r[1] in o["hosts"])]
+    # biggest files first, one per task: no worker is left holding the long tail
+    tasks = sorted(session_files(roots, o["since"]), key=lambda t: -os.path.getsize(t[2]))
+
+    # One response may sit in several files (forks, hosts): keep the earliest copy
+    # (ties by host) for dating and attribution, and the largest usage seen.
+    best, loose, errors = {}, [], []
+    with mp.get_context("fork").Pool() as pool:
+        for (agent, host, _), (error, recs) in zip(tasks, pool.imap(parse_file, tasks)):
+            if error:
+                errors.append(error)
+            for key, minute, model, u, c in recs:
+                rec = [minute, host, agent, model, u, c]
+                if key is None:
+                    loose.append(rec)
+                    continue
+                old = best.get((agent, key))
+                if old is None:
+                    best[(agent, key)] = rec
+                    continue
+                repriced = u != old[4] or (minute, host) < (old[0], old[1]) and model != old[3]
+                if (minute, host) < (old[0], old[1]):
+                    old[:4] = rec[:4]
+                if repriced:
+                    old[4] = merge(old[4], u)
+                    old[5] = COST(old[3], old[4])
+
+    period, unpriced = PERIODS[o["period"]], set()
+    rows = defaultdict(lambda: [0, 0, 0, 0, 0.0])  # input, cache write, cache read, output, cost
+    for minute, host, agent, model, u, c in [*best.values(), *loose]:
+        day = local_day(minute)
+        if o["since"] and day < o["since"] or o["until"] and day > o["until"]:
+            continue
+        if c is None:
+            unpriced.add(model)
+        dims = dict(agent=agent, host=host, model=model)
+        r = rows[(period(day), *(dims[d] for d in o["by"]))]
+        r[0] += u[0]; r[1] += u[1]; r[2] += u[3]; r[3] += u[4]; r[4] += c or 0
+    for error in errors:
+        print(f"agents usage: skipped unreadable {error}", file=sys.stderr)
+    if not tasks:
+        print("agents usage: no session logs found", file=sys.stderr)
+
+    cols = ("input", "output", "cache_write", "cache_read", "total") + (("cost",) if o["cost"] else ())
+    def fields(r):
+        return dict(input=r[0], output=r[3], cache_write=r[1], cache_read=r[2], total=sum(r[:4]), cost=round(r[4], 4))
+    ordered = sorted(rows.items(), key=lambda kv: (kv[0][0], -sum(kv[1][:4]), kv[0]))
+    totals = [sum(r[i] for r in rows.values()) for i in range(5)]
+    if o["json"]:
+        json.dump({"rows": [dict(period=k[0], **dict(zip(o["by"], k[1:])), **{c: fields(r)[c] for c in cols})
+                            for k, r in ordered],
+                   "totals": {c: fields(totals)[c] for c in cols},
+                   "unpriced_models": sorted(unpriced)}, sys.stdout, indent=2)
+        print()
+        return
+    lead = 0 if o["period"] == "total" else 1  # a single period needs no column
+    head = [o["period"].upper()][:lead] + [d.upper() for d in o["by"]] + \
+           ["INPUT", "OUTPUT", "CACHE W", "CACHE R", "TOTAL"] + (["COST"] if o["cost"] else [])
+    def line(label, r):
+        f = fields(r)
+        return [*label, *(human(f[c]) for c in cols[:5])] + ([f"${f['cost']:,.2f}"] if o["cost"] else [])
+    labels = lead + len(o["by"])
+    table = [head] + [line(k[1 - lead:], r) for k, r in ordered]
+    if labels:  # without label columns the only row already is the total
+        table.append(line(("TOTAL", *[""] * (labels - 1)), totals))
+    widths = [max(len(row[i]) for row in table) for i in range(len(head))]
+    bold, rst = ("\033[1m", "\033[0m") if sys.stdout.isatty() and not os.environ.get("NO_COLOR") else ("", "")
+    for i, row in enumerate(table):
+        cells = [c.ljust(w) if j < labels else c.rjust(w) for j, (c, w) in enumerate(zip(row, widths))]
+        text = "  ".join(cells).rstrip()
+        print(f"{bold}{text}{rst}" if i in (0, len(table) - 1) else text)
+    if unpriced and o["cost"]:
+        print(f"unpriced models (cost not counted): {', '.join(sorted(unpriced))}", file=sys.stderr)
+
+main()
+PY
+}
+
 # ── commands ──────────────────────────────────────────────────────────
 cmd_show() {
   local found=0 vw=$(ver_width)
@@ -281,6 +699,41 @@ cmd_uninstall() {
   eval "$cmd" && print -r -- "$OK ${BOLD}$target${RST} uninstalled"
 }
 
+# Positional args name agents and/or hosts; none means all of them.
+cmd_sync() {
+  load_sync_conf
+  local agents=() hosts=() x h failed=0
+  for x in "$@"; do
+    if (( ${SESSION_AGENTS[(Ie)$x]} )); then agents+=("$x")
+    elif (( ${HOSTS[(Ie)$x]} )); then hosts+=("$x")
+    else die "unknown agent or host: ${BOLD}$x${RST} ${DIM}(agents: $SESSION_AGENTS; hosts: $HOSTS)${RST}"; fi
+  done
+  (( $#agents )) || agents=($SESSION_AGENTS)
+  (( $#hosts )) || hosts=($HOSTS)
+  (( $#hosts )) || die "sync.conf: no hosts configured"
+  local rsync=${AGENTS_RSYNC:-${LOCAL_RSYNC:-rsync}}
+  [[ "$("$rsync" --version 2>/dev/null)" == "rsync  version 3"* ]] ||
+    die "sync needs rsync 3.x, not $(tilde "$(command -v "$rsync" || echo "$rsync")") ${DIM}(set 'rsync <path>' in sync.conf)${RST}"
+  for h in $hosts; do sync_host "$rsync" "$h" $agents || failed=1; done
+  return "$failed"
+}
+
+# Reads the archive when sync is configured, else this machine's own sessions.
+cmd_usage() {
+  installed python3 || die "agents usage needs python3"
+  local roots=() a d
+  if [[ -r "$SYNC_CONF" ]]; then
+    load_sync_conf
+    [[ -d "$ARCHIVE/hosts" ]] || die "no archive at $(tilde "$ARCHIVE") ${DIM}(run agents sync first)${RST}"
+    for d in "$ARCHIVE/hosts"/*(N/); do
+      for a in $SESSION_AGENTS; do roots+=("${a}:${d:t}:$d/$(session_home "$a")"); done
+    done
+  else
+    for a in $SESSION_AGENTS; do roots+=("${a}:local:$HOME/$(session_home "$a")"); done
+  fi
+  usage_report "${roots[@]}" -- "$@"
+}
+
 cmd_help() {
   cat <<EOF
 ${BOLD}agents${RST} — minimal AI coding-agent manager
@@ -290,6 +743,11 @@ ${BOLD}agents${RST} — minimal AI coding-agent manager
   ${CYN}agents install${RST} <x|all>  install
   ${CYN}agents update${RST} ${DIM}[x]${RST}       update everything, or just x
   ${CYN}agents uninstall${RST} <x>    uninstall (asks for confirmation)
+
+  ${CYN}agents sync${RST} ${DIM}[agent] [host]${RST}  archive sessions from configured hosts
+  ${CYN}agents usage${RST} ${DIM}[options]${RST}      token usage and cost across archived sessions
+      ${DIM}daily|weekly|monthly|total   [agent] [host]   --by agent,host,model|none
+      --since/--until YYYY-MM-DD    --json    --no-cost${RST}
 
   ${DIM}aliases: ls=list  up=update  rm=uninstall${RST}
 EOF
@@ -302,6 +760,8 @@ case "${1:-show}" in
   install)       cmd_install "${2:-}" ;;
   update|up)     cmd_update "${2:-}" ;;
   uninstall|rm)  cmd_uninstall "${2:-}" ;;
+  sync)          shift; cmd_sync "$@" ;;
+  usage)         shift; cmd_usage "$@" ;;
   -h|--help|help) cmd_help ;;
   *) die "unknown command: $1 ${DIM}(agents help)${RST}" ;;
 esac
