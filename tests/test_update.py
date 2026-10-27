@@ -33,6 +33,8 @@ if name == "curl":
     if s.get("download_fail"): finish(22, "download failed")
     if "https://chatgpt.com/codex/install.sh" in args:
         finish(text="exec " + sys.executable + " " + str(pathlib.Path(sys.argv[0]).with_name("install-standalone")))
+    if "https://pi.dev/install.sh" in args:
+        finish(text="exec " + sys.executable + " " + str(pathlib.Path(sys.argv[0]).with_name("install-pi")))
     if "install_claude" in s:
         binary = pathlib.Path(os.environ["HOME"]) / ".local/bin/claude"
         binary.parent.mkdir(parents=True, exist_ok=True)
@@ -53,6 +55,21 @@ if name == "install-standalone":
     if launcher.is_symlink(): launcher.unlink()
     launcher.symlink_to(binary)
     finish()
+if name == "install-pi":
+    s["pi"] = s.get("new_pi", "1.0.0")
+    agent = pathlib.Path(os.environ["HOME"]) / ".pi/agent"
+    launcher = agent / "bin/pi"
+    launcher.parent.mkdir(parents=True, exist_ok=True)
+    launcher.write_text(pathlib.Path(sys.argv[0]).read_text())
+    launcher.chmod(0o755)
+    link = pathlib.Path(os.environ["HOME"]) / ".local/bin/pi"
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(launcher)
+    (agent / "install").mkdir(exist_ok=True)
+    (agent / "install/managed-install.json").write_text(json.dumps(
+        {"kind": "pi-managed-install", "schemaVersion": 1, "layout": "releases-v1",
+         "entrypoint": {"type": "symlink", "path": str(link)}}, indent=2))
+    finish()
 if name == "restart-codex": restart()
 if name == "systemctl":
     if "is-active" in args:
@@ -69,6 +86,10 @@ if name == "npm":
     finish()
 if args == ["--version"]:
     finish(text=name + " " + s[name])
+if name == "pi" and args == ["update"]:
+    if s.get("update_fail") == "pi": finish(1, "update failed")
+    s["pi"] = s.get("new_pi", s["pi"])
+    finish()
 if name == "codex":
     if args == ["features", "list"]:
         finish(1 if s.get("config_fail") else 0, "config check")
@@ -109,7 +130,8 @@ class UpdateTests(unittest.TestCase):
         self.state_path = self.root / "state.json"
         self.state = {"codex": "1.0.0", "new_codex": "1.1.0",
                       "server": "1.0.0", "standalone": "1.0.0", "calls": []}
-        for name in ("codex", "npm", "systemctl", "sleep", "restart-codex", "curl", "install-standalone"):
+        for name in ("codex", "npm", "systemctl", "sleep", "restart-codex", "curl",
+                     "install-standalone", "install-pi"):
             self.install_mock(name)
         self.env = {"PATH": str(self.bin) + ":/usr/bin:/bin",
                     "HOME": str(self.home), "NO_COLOR": "1",
@@ -129,13 +151,18 @@ class UpdateTests(unittest.TestCase):
         }
         self.daemon_pid_path.write_text(json.dumps(self.daemon_record))
 
-    def install_mock(self, name):
+    def install_mock(self, name, legacy=False):
         p = self.bin / name
         if name in ("codex", "pi"):
             if name == "codex":
                 target = self.home / ".codex/packages/standalone/current/bin/codex"
-            else:
+            elif legacy:
                 target = self.root / "node_modules/@earendil-works/pi-coding-agent/bin/pi"
+            else:
+                target = self.home / ".pi/agent/bin/pi"
+                marker = self.home / ".pi/agent/install/managed-install.json"
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.write_text(json.dumps({"entrypoint": {"type": "symlink", "path": str(p)}}))
             target.parent.mkdir(parents=True, exist_ok=True)
             p.symlink_to(target)
             p = target
@@ -367,16 +394,48 @@ class UpdateTests(unittest.TestCase):
                 self.assertEqual(self.state["server"], "1.0.0")
                 del self.state[failure]
 
-    def test_wrong_npm_prefix_blocks_update_and_uninstall(self):
-        self.install_mock("pi")
+    def test_npm_pi_is_not_modified_and_points_to_migration(self):
+        self.install_mock("pi", legacy=True)
         self.state["pi"] = "2.0.0"
-        self.state["npm_root"] = str(self.root / "other-prefix/node_modules")
+        for command in ("update", "uninstall"):
+            with self.subTest(command=command):
+                r = self.run_agents(command, "pi", input="y\n")
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn("https://pi.dev/install.sh", r.stderr)
+                self.assertFalse(self.state["calls"])
+
+    def test_pi_without_managed_marker_is_not_modified(self):
+        self.install_mock("pi")
+        (self.home / ".pi/agent/install/managed-install.json").unlink()
+        self.state["pi"] = "2.0.0"
         for command in ("update", "uninstall"):
             with self.subTest(command=command):
                 r = self.run_agents(command, "pi", input="y\n")
                 self.assertNotEqual(r.returncode, 0)
                 self.assertIn("unsupported installation", r.stderr)
-                self.assertTrue(all(c == ["npm", "root", "-g"] for c in self.state["calls"]))
+                self.assertFalse(self.state["calls"])
+
+    def test_fresh_pi_install_uses_managed_installer_without_npm(self):
+        self.env["PATH"] = str(self.home / ".local/bin") + ":" + self.env["PATH"]
+        self.state["new_pi"] = "1.4.0"
+        r = self.run_agents("install", "pi")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("pi 1.4.0 installed", r.stdout)
+        self.assertFalse(any(c[0] == "npm" for c in self.state["calls"]))
+
+    def test_pi_uninstall_preserves_agent_data_and_unrelated_launcher(self):
+        self.env["PATH"] = str(self.home / ".local/bin") + ":" + self.env["PATH"]
+        self.run_agents("install", "pi")
+        agent = self.home / ".pi/agent"
+        (agent / "settings.json").write_text("user settings")
+        (agent / "bin/rg").write_text("unrelated executable")
+        r = self.run_agents("uninstall", "pi", input="y\n")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertFalse((agent / "install").exists())
+        self.assertFalse((agent / "bin/pi").exists())
+        self.assertFalse((self.home / ".local/bin/pi").is_symlink())
+        self.assertEqual((agent / "bin/rg").read_text(), "unrelated executable")
+        self.assertEqual((agent / "settings.json").read_text(), "user settings")
 
     def test_unsupported_native_install_is_not_modified(self):
         self.install_mock("amp")

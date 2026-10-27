@@ -13,7 +13,7 @@ meta() {
     claude)   echo 'native^curl -fsSL https://claude.ai/install.sh | bash^claude update^rm -rf ~/.local/share/claude ~/.local/bin/claude' ;;
     codex)    echo 'native^curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh^curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh^uninstall_codex' ;;
     amp)      echo 'native^curl -fsSL https://ampcode.com/install.sh | bash^curl -fsSL https://ampcode.com/install.sh | bash^rm -rf ~/.amp ~/.local/bin/amp' ;;
-    pi)       echo 'npm^npm install -g @earendil-works/pi-coding-agent@latest^npm install -g @earendil-works/pi-coding-agent@latest^npm rm -g @earendil-works/pi-coding-agent' ;;
+    pi)       echo 'native^curl -fsSL https://pi.dev/install.sh | sh^pi update^uninstall_pi' ;;
     cursor-agent) echo 'native^curl -fsSL https://cursor.com/install | bash^cursor-agent update^uninstall_cursor_agent' ;;
     *)        return 1 ;;
   esac
@@ -66,9 +66,12 @@ check_installation() {
       root="${CODEX_HOME:-$HOME/.codex}/packages/standalone/current"
       [[ "$actual" == "${root:A}/codex" || "$actual" == "${root:A}/bin/codex" ]] && return 0 ;;
     pi)
-      root=$(npm root -g) || return 1
-      expected="$root/@earendil-works/pi-coding-agent"
-      [[ "$actual" == "${expected:A}/"* ]] && return 0 ;;
+      root=$(pi_agent_dir)
+      [[ "$actual" == "${root:A}/bin/pi" && -f "$root/install/managed-install.json" ]] && return 0
+      if [[ "$actual" == */node_modules/@earendil-works/pi-coding-agent/* ]]; then
+        print -u2 -- "pi: npm installation at $actual; migrate once with: curl -fsSL https://pi.dev/install.sh | sh"
+        return 1
+      fi ;;
     claude) [[ "$actual" == "$HOME/.local/share/claude/versions/"* || "$actual" == "$HOME/.local/bin/claude" ]] && return 0 ;;
     amp) [[ "$actual" == "$HOME/.amp/bin/amp" || "$actual" == "$HOME/.local/bin/amp" ]] && return 0 ;;
     cursor-agent) [[ "$actual" == "$HOME/.local/share/cursor-agent/versions/"* || "$actual" == "$HOME/.local/bin/cursor-agent" ]] && return 0 ;;
@@ -87,6 +90,24 @@ uninstall_codex() {
     fi
   done
   rm -rf "$root"
+}
+
+# Pi's managed install lives under its agent dir, next to config and sessions.
+pi_agent_dir() { print -r -- "${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"; }
+
+# Remove the managed release, its launcher, and links to it; keep the rest of the
+# agent dir (settings, auth, sessions, packages).
+uninstall_pi() {
+  local agent=$(pi_agent_dir) link entry
+  local root="$agent/install" launcher="$agent/bin/pi"
+  [[ -f "$root/managed-install.json" ]] || return 1
+  entry=$(daemon_field "$(<"$root/managed-install.json")" path)
+  for link in "$entry" "$(command -v pi)"; do
+    if [[ -n "$link" && -L "$link" && "${link:A}" == "${launcher:A}" ]]; then
+      rm -f "$link" || return 1
+    fi
+  done
+  rm -f "$launcher" && rm -rf "$root"
 }
 
 # Remove installer-owned launchers only. Keep ~/.cursor (auth and sessions).

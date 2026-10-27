@@ -10,13 +10,8 @@ fi
 echo 'Checking runtime dependencies...'
 SECONDS=0
 packages=()
-for tool in zsh curl node npm; do
-  if ! command -v "$tool" >/dev/null 2>&1; then
-    case "$tool" in
-      node) packages+=(nodejs) ;;
-      *) packages+=("$tool") ;;
-    esac
-  fi
+for tool in zsh curl; do
+  command -v "$tool" >/dev/null 2>&1 || packages+=("$tool")
 done
 if (( ${#packages[@]} )); then
   "${sudo_cmd[@]}" apt-get update

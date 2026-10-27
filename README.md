@@ -2,11 +2,11 @@
 
 A small CLI to install, update, and uninstall **Claude, Codex, Amp, Pi, and Cursor Agent**,
 and to archive their sessions across machines and report token usage.
-One zsh script, using official native installers for Claude / Codex / Amp / Cursor Agent and npm for Pi.
+One zsh script, using each agent's official native installer.
 
 ## Install
 
-Requires **zsh**, **bash**, and **curl**; **Node.js and npm** for Pi.
+Requires **zsh**, **bash**, and **curl**.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/mrzzmrzz/agents-cli/main/install.sh | bash
@@ -29,8 +29,7 @@ agents usage [options]       Token usage and cost across sessions
 
 Aliases: `ls` → `list`, `up` → `update`, `rm` → `uninstall`.
 
-Updates and uninstalls accept default native installation paths and packages under
-the active npm global root. Other layouts are rejected rather than modifying the
+Updates and uninstalls accept only default native installation paths. Other layouts are rejected rather than modifying the
 wrong copy; use their original installer or fix `PATH`. The displayed channel is
 the supported channel, not automatic installation detection.
 
@@ -49,6 +48,14 @@ export PATH="${CODEX_INSTALL_DIR:-$HOME/.local/bin}:$PATH"
 
 Existing npm installations are not automatically removed. Custom services that
 launch an npm path must be updated to launch the standalone CLI.
+
+Pi installs with `curl -fsSL https://pi.dev/install.sh | sh` (which installs
+Node.js if needed) and updates with `pi update`. The managed release lives in
+`~/.pi/agent/install` (or `$PI_CODING_AGENT_DIR/install`) with its launcher at
+`~/.pi/agent/bin/pi`. Uninstall removes the release, the launcher, and links to it,
+preserving settings, credentials, sessions, and packages in `~/.pi/agent`.
+An npm-installed Pi is rejected; run the installer once and accept **Migrate** to
+replace it with the managed installation.
 
 Cursor Agent installs with `curl -fsSL https://cursor.com/install | bash`.
 The command registered here is `cursor-agent`; the official installer also links
